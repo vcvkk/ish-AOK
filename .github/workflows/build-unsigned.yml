@@ -9,6 +9,10 @@ jobs:
         with:
           submodules: true
 
+      - name: Install build dependencies
+        run: |
+          brew install llvm ninja libarchive meson
+
       - name: Build unsigned
         run: |
           xcodebuild -project iSH-AOK.xcodeproj -scheme iSH \
