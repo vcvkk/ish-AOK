@@ -11,7 +11,8 @@ jobs:
 
       - name: Install build dependencies
         run: |
-          brew install llvm ninja libarchive meson
+          brew install llvm ninja libarchive meson lld
+          echo "$(brew --prefix lld)/bin" >> "$GITHUB_PATH"
 
       - name: Disable scheme parallelization (FB19282108 workaround)
         run: |
