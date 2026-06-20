@@ -13,12 +13,13 @@ jobs:
         run: |
           brew install llvm ninja libarchive meson lld
           echo "$(brew --prefix lld)/bin" >> "$GITHUB_PATH"
+          sudo mkdir -p /usr/local/opt
+          sudo ln -sf "$(brew --prefix libarchive)" /usr/local/opt/libarchive
 
       - name: Disable scheme parallelization (FB19282108 workaround)
         run: |
           sed -i '' 's/parallelizeBuildables = "YES"/parallelizeBuildables = "NO"/' \
             iSH-AOK.xcodeproj/xcshareddata/xcschemes/iSH.xcscheme
-          cat iSH-AOK.xcodeproj/xcshareddata/xcschemes/iSH.xcscheme | grep -A1 BuildAction
 
       - name: Build unsigned (retry on FB19282108 race)
         run: |
