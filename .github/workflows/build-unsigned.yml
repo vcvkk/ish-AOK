@@ -13,12 +13,17 @@ jobs:
         run: |
           brew install llvm ninja libarchive meson
 
+      - name: Disable scheme parallelization (FB19282108 workaround)
+        run: |
+          sed -i '' 's/parallelizeBuildables = "YES"/parallelizeBuildables = "NO"/' \
+            iSH-AOK.xcodeproj/xcshareddata/xcschemes/iSH.xcscheme
+          cat iSH-AOK.xcodeproj/xcshareddata/xcschemes/iSH.xcscheme | grep -A1 BuildAction
+
       - name: Build unsigned (retry on FB19282108 race)
         run: |
           for i in 1 2 3; do
             xcodebuild -project iSH-AOK.xcodeproj -scheme iSH \
               -sdk iphoneos -configuration Debug-ApplePleaseFixFB19282108 \
-              -parallelizeTargets NO \
               build CODE_SIGNING_ALLOWED=NO \
               CONFIGURATION_BUILD_DIR=$PWD/build \
               IDEBuildOperationMaxNumberOfConcurrentCompileTasks=1 \
