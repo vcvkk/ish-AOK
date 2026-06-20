@@ -1,0 +1,28 @@
+name: build-unsigned
+on: workflow_dispatch
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: Build unsigned
+        run: |
+          xcodebuild -project iSH-AOK.xcodeproj -scheme iSH \
+            -sdk iphoneos -configuration Debug-ApplePleaseFixFB19282108 \
+            build CODE_SIGNING_ALLOWED=NO \
+            CONFIGURATION_BUILD_DIR=$PWD/build
+
+      - name: Package IPA
+        run: |
+          mkdir -p Payload
+          cp -r build/*.app Payload/
+          zip -r iSH-AOK.ipa Payload
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: iSH-AOK-ipa
+          path: iSH-AOK.ipa
