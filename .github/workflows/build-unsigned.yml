@@ -21,13 +21,14 @@ jobs:
           sed -i '' 's/parallelizeBuildables = "YES"/parallelizeBuildables = "NO"/' \
             iSH-AOK.xcodeproj/xcshareddata/xcschemes/iSH.xcscheme
 
-      - name: Build unsigned (retry on FB19282108 race)
+      - name: Build unsigned with dSYM
         run: |
           for i in 1 2 3; do
             xcodebuild -project iSH-AOK.xcodeproj -scheme iSH \
               -sdk iphoneos -configuration Debug-ApplePleaseFixFB19282108 \
               build CODE_SIGNING_ALLOWED=NO \
               CONFIGURATION_BUILD_DIR=$PWD/build \
+              DEBUG_INFORMATION_FORMAT=dwarf-with-dsym \
               IDEBuildOperationMaxNumberOfConcurrentCompileTasks=1 \
               && break
             echo "Build attempt $i failed, retrying..."
@@ -40,7 +41,17 @@ jobs:
           cp -r build/*.app Payload/
           zip -r iSH-AOK.ipa Payload
 
+      - name: Package dSYMs
+        run: |
+          ls build/*.dSYM
+          zip -r dSYMs.zip build/*.dSYM
+
       - uses: actions/upload-artifact@v4
         with:
           name: iSH-AOK-ipa
           path: iSH-AOK.ipa
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: iSH-AOK-dsyms
+          path: dSYMs.zip
