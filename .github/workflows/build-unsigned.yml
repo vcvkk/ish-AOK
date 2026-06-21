@@ -7,7 +7,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          submodules: true
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Verify submodules
+        run: |
+          git submodule status
+          ls -la deps/libapps/hterm/dist/js/ || echo "MISSING — forcing manual submodule init"
+          git submodule update --init --recursive --force
+          ls -la deps/libapps/hterm/dist/js/
 
       - name: Install build dependencies
         run: |
@@ -21,7 +29,7 @@ jobs:
           sed -i '' 's/parallelizeBuildables = "YES"/parallelizeBuildables = "NO"/' \
             iSH-AOK.xcodeproj/xcshareddata/xcschemes/iSH.xcscheme
 
-      - name: Build unsigned with dSYM
+      - name: Build unsigned with dSYM (retry on FB19282108 race)
         run: |
           for i in 1 2 3; do
             xcodebuild -project iSH-AOK.xcodeproj -scheme iSH \
