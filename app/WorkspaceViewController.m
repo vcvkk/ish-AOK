@@ -8,6 +8,7 @@
 #include "kernel/init.h"
 #import "TerminalViewController.h"
 #import "UserPreferences.h"
+#import "NSObject+SaneKVO.h"
 #import <WebKit/WebKit.h>
 #include "kernel/task.h"
 #include <arpa/inet.h>
@@ -20,16 +21,20 @@
 
 @class ISHWorkspaceContainedWindowView;
 
-@interface WorkspaceViewController ()
+@interface WorkspaceViewController () <UIGestureRecognizerDelegate>
 
 @property (nonatomic, copy) NSString *initialToolIdentifier;
 @property (nonatomic) BOOL didOpenInitialTool;
+@property (nonatomic, strong) UIButton *modernMenuPip;
 @property (nonatomic) BOOL didEnsureDefaultWorkspaceUtilities;
 @property (nonatomic, strong) UIView *desktopSurfaceView;
 @property (nonatomic, strong) UIImageView *desktopWallpaperView;
 @property (nonatomic, copy) NSString *appliedWallpaperThemeIdentifier;
 @property (nonatomic) CGSize appliedWallpaperImageSize;
 @property (nonatomic, strong) NSMutableArray<UIView *> *desktopWindows;
+@property (nonatomic) NSInteger activeDesktopIndex;
+@property (nonatomic) NSInteger desktopCount;
+@property (nonatomic, weak) UILabel *desktopIndicatorLabel;
 @property (nonatomic) NSInteger desktopWindowCascadeIndex;
 @property (nonatomic, weak) ISHWorkspaceContainedWindowView *dashboardWindow;
 @property (nonatomic, weak) ISHWorkspaceContainedWindowView *dockWindow;
@@ -44,6 +49,9 @@
 
 - (void)openWorkspaceToolWithIdentifier:(NSString *)toolIdentifier;
 - (void)openOrFocusWorkspaceToolIdentifier:(NSString *)toolIdentifier;
+- (void)switchToDesktopIndex:(NSInteger)index;
+- (void)createNewDesktop;
+- (void)removeDesktopAtIndex:(NSInteger)index;
 - (void)ensureDefaultWorkspaceUtilitiesOpen;
 - (void)ensureDefaultLLMChatWindowOpenIfNeeded;
 - (void)persistDefaultWorkspaceUtilityFrames;
@@ -93,6 +101,7 @@ static NSString *const ISHWorkspaceToolFilesystemsIdentifier = @"filesystems";
 static NSString *const ISHWorkspaceToolSettingsIdentifier = @"settings";
 static NSString *const ISHWorkspaceToolDiagnosticsIdentifier = @"diagnostics";
 static NSString *const ISHWorkspaceToolLLMIdentifier = @"llm";
+static NSString *const ISHWorkspaceToolLauncherIdentifier = @"launcher";
 static NSString *const ISHWorkspaceSavedLayoutDefaultsKey = @"ISHWorkspaceSavedLayout";
 static NSString *const ISHWorkspacePersistentWorkspacesWindowFrameDefaultsKey = @"ISHWorkspacePersistentWorkspacesWindowFrame";
 static NSString *const ISHWorkspaceLegacyPersistentWorkspacesWindowFrameDefaultsKeyPrefix = @"ISHWorkspacePersistentWorkspacesWindowFrame";
@@ -100,6 +109,7 @@ static NSString *const ISHWorkspacePersistentDockWindowDescriptorDefaultsKey = @
 static NSString *const ISHWorkspaceForgottenHiddenSessionsDefaultsKey = @"ISHWorkspaceForgottenHiddenSessions";
 static NSString *const ISHWorkspaceDockFrameDidChangeNotification = @"ISHWorkspaceDockFrameDidChange";
 static NSString *const ISHWorkspaceWorkspacesFrameDidChangeNotification = @"ISHWorkspaceWorkspacesFrameDidChange";
+static NSString *const ISHWorkspaceDesktopsDidChangeNotification = @"ISHWorkspaceDesktopsDidChange";
 static NSString *const ISHWorkspaceSavedLayoutKindDashboard = @"dashboard";
 static NSString *const ISHWorkspaceSavedLayoutKindDock = @"dock";
 static NSString *const ISHWorkspaceSavedLayoutKindTool = @"tool";
@@ -115,6 +125,66 @@ static const CGFloat ISHWorkspaceWindowTitleSideInset = 34.0;
 
 static BOOL ISHWorkspaceUsesPhoneLayout(void) {
     return UIDevice.currentDevice.userInterfaceIdiom == UIUserInterfaceIdiomPhone;
+}
+
+// The Workspace ships two coexisting experiences, selected by the "Workspace Style"
+// preference: Classic (the long-standing look) and Modern (the flat, ctwm-inspired
+// reskin). Modern currently mirrors Classic; each rung fills in its divergences behind
+// this gate so the Classic experience is never disturbed.
+static BOOL ISHWorkspaceUsesModernStyle(void) {
+    return UserPreferences.shared.workspaceStyle == WorkspaceStyleModern;
+}
+
+// User-defined launcher shortcuts: each is @{@"name", @"command"}; the command is
+// run in a fresh terminal. Stored in NSUserDefaults.
+static NSString *const ISHWorkspaceLauncherShortcutsKey = @"ISHWorkspaceLauncherShortcuts";
+static NSString *const ISHWorkspaceLauncherShortcutsDidChangeNotification = @"ISHWorkspaceLauncherShortcutsDidChangeNotification";
+
+static NSArray<NSDictionary<NSString *, NSString *> *> *ISHWorkspaceLauncherShortcuts(void) {
+    NSArray *stored = [NSUserDefaults.standardUserDefaults arrayForKey:ISHWorkspaceLauncherShortcutsKey];
+    return [stored isKindOfClass:NSArray.class] ? stored : @[];
+}
+
+static void ISHWorkspaceSetLauncherShortcuts(NSArray<NSDictionary<NSString *, NSString *> *> *shortcuts) {
+    [NSUserDefaults.standardUserDefaults setObject:shortcuts forKey:ISHWorkspaceLauncherShortcutsKey];
+    // Live-update any open Launcher applet (and the menu next time it's built).
+    [NSNotificationCenter.defaultCenter postNotificationName:ISHWorkspaceLauncherShortcutsDidChangeNotification object:nil];
+}
+
+// A launcher shortcut whose command is just a {token} opens a built-in tool/applet instead of
+// running a shell command. Returns the tool identifier for a recognized token, or nil.
+static NSString *ISHWorkspaceLauncherToolIdentifierForCommand(NSString *command) {
+    NSString *trimmed = [command stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+    if (trimmed.length < 3 || ![trimmed hasPrefix:@"{"] || ![trimmed hasSuffix:@"}"])
+        return nil;
+    NSString *token = [[trimmed substringWithRange:NSMakeRange(1, trimmed.length - 2)]
+                       stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceCharacterSet].lowercaseString;
+    NSDictionary<NSString *, NSString *> *map = @{
+        @"browser": ISHWorkspaceToolBrowserIdentifier,
+        @"web": ISHWorkspaceToolBrowserIdentifier,
+        @"web_browser": ISHWorkspaceToolBrowserIdentifier,
+        @"webbrowser": ISHWorkspaceToolBrowserIdentifier,
+        @"clock": ISHWorkspaceToolClockIdentifier,
+        @"settings": ISHWorkspaceToolSettingsIdentifier,
+        @"themes": ISHWorkspaceToolThemesIdentifier,
+        @"sessions": ISHWorkspaceToolSessionsIdentifier,
+        @"storage": ISHWorkspaceToolStorageIdentifier,
+        @"monitor": ISHWorkspaceToolMonitorIdentifier,
+        @"networks": ISHWorkspaceToolNetworksIdentifier,
+        @"logs": ISHWorkspaceToolStatusIdentifier,
+        @"status": ISHWorkspaceToolStatusIdentifier,
+        @"diagnostics": ISHWorkspaceToolDiagnosticsIdentifier,
+        @"filesystems": ISHWorkspaceToolFilesystemsIdentifier,
+        @"images": ISHWorkspaceToolFilesystemsIdentifier,
+        @"boot_images": ISHWorkspaceToolFilesystemsIdentifier,
+        @"info": ISHWorkspaceToolInfoIdentifier,
+        @"workspaces": ISHWorkspaceToolWorkspacesIdentifier,
+        @"shortcuts": ISHWorkspaceToolShortcutsIdentifier,
+        @"quick_actions": ISHWorkspaceToolShortcutsIdentifier,
+        @"llm": ISHWorkspaceToolLLMIdentifier,
+        @"chat": ISHWorkspaceToolLLMIdentifier,
+    };
+    return map[token];
 }
 
 static BOOL ISHWorkspaceSupportsSceneWindows(void) {
@@ -153,6 +223,7 @@ static CGRect ISHWorkspaceRectWithRoundedOriginPreservingSize(CGRect frame) {
 @property (nonatomic, copy, nullable) dispatch_block_t didBecomeFrontmostHandler;
 @property (nonatomic, copy, nullable) dispatch_block_t frameDidChangeHandler;
 @property (nonatomic, weak) TerminalViewController *hostedTerminalViewController;
+@property (nonatomic) NSInteger workspaceDesktopIndex;
 @property (nonatomic, copy) NSString *workspaceToolIdentifier;
 @property (nonatomic, copy) NSString *workspaceTerminalRole;
 @property (nonatomic) BOOL pinnedToBottomCenter;
@@ -166,6 +237,7 @@ static CGRect ISHWorkspaceRectWithRoundedOriginPreservingSize(CGRect frame) {
 - (instancetype)initWithTitle:(NSString *)title showsCloseButton:(BOOL)showsCloseButton;
 - (void)setUtilityButtonTitle:(nullable NSString *)title handler:(nullable dispatch_block_t)handler;
 - (void)applyWorkspaceChromeTheme:(NSDictionary<NSString *, UIColor *> *)theme active:(BOOL)active;
+- (void)applyModernWorkspaceChromeTheme:(NSDictionary<NSString *, UIColor *> *)theme active:(BOOL)active;
 
 @end
 
@@ -337,6 +409,11 @@ static CGRect ISHWorkspaceRectWithRoundedOriginPreservingSize(CGRect frame) {
     if (![theme isKindOfClass:NSDictionary.class])
         return;
 
+    if (ISHWorkspaceUsesModernStyle()) {
+        [self applyModernWorkspaceChromeTheme:theme active:active];
+        return;
+    }
+
     UIColor *strokeColor = active
         ? [(theme[@"focusRing"] ?: theme[@"accent"]) colorWithAlphaComponent:0.95]
         : [theme[@"stroke"] colorWithAlphaComponent:0.98];
@@ -363,6 +440,46 @@ static CGRect ISHWorkspaceRectWithRoundedOriginPreservingSize(CGRect frame) {
         ? [(theme[@"focusRing"] ?: theme[@"accent"]) colorWithAlphaComponent:0.92]
         : [(theme[@"focusRing"] ?: theme[@"accentAlt"]) colorWithAlphaComponent:0.55];
     self.layer.shadowColor = [theme[@"backgroundTop"] colorWithAlphaComponent:0.55].CGColor;
+}
+
+- (void)applyModernWorkspaceChromeTheme:(NSDictionary<NSString *, UIColor *> *)theme active:(BOOL)active {
+    BOOL dark = UserPreferences.shared.requestingDarkAppearance;
+    UIColor *accent = theme[@"accent"];
+    UIColor *focusRing = theme[@"focusRing"] ?: accent;
+
+    // Modern uses neutral light/dark surfaces (the chrome theme only supplies the
+    // accent), so the windows stay coherent with the flat desktop in both appearances.
+    UIColor *card = dark ? [UIColor colorWithRed:0.13 green:0.14 blue:0.17 alpha:1.0]
+                         : UIColor.whiteColor;
+    UIColor *titleText = dark ? [UIColor colorWithWhite:0.92 alpha:1.0]
+                              : [UIColor colorWithRed:0.11 green:0.13 blue:0.18 alpha:1.0];
+    UIColor *hairline = dark ? [UIColor colorWithWhite:1.0 alpha:0.14]
+                             : [UIColor colorWithWhite:0.0 alpha:0.10];
+    UIColor *mutedGlyph = dark ? [UIColor colorWithWhite:0.62 alpha:1.0]
+                               : [UIColor colorWithWhite:0.42 alpha:1.0];
+
+    self.panelView.backgroundColor = card;
+    self.contentContainerView.backgroundColor = card;
+    // Focused window: solid accent title bar with white text. Otherwise the flat card.
+    self.titleBarView.backgroundColor = active ? accent : card;
+    self.titleLabel.textColor = active ? UIColor.whiteColor : titleText;
+
+    // Hairline border in repose; a crisp accent ring marks focus.
+    self.panelView.layer.borderWidth = active ? 1.5 : 1.0;
+    self.panelView.layer.borderColor = (active ? focusRing : hairline).CGColor;
+
+    // Quiet, flat window controls: tinted glyphs, no filled chips or borders.
+    self.closeButton.backgroundColor = UIColor.clearColor;
+    self.closeButton.layer.borderWidth = 0.0;
+    [self.closeButton setTitleColor:(active ? UIColor.whiteColor : mutedGlyph) forState:UIControlStateNormal];
+    self.utilityButton.backgroundColor = UIColor.clearColor;
+    self.utilityButton.layer.borderWidth = 0.0;
+    [self.utilityButton setTitleColor:(active ? UIColor.whiteColor : mutedGlyph) forState:UIControlStateNormal];
+
+    self.resizeHandleView.backgroundColor = active ? [focusRing colorWithAlphaComponent:0.9] : hairline;
+
+    // Neutral flat elevation in both appearances.
+    self.layer.shadowColor = UIColor.blackColor.CGColor;
 }
 
 - (void)layoutSubviews {
@@ -533,6 +650,40 @@ static UIViewController *ISHCreateRootsViewController(void) {
     return [[UIStoryboard storyboardWithName:@"Roots" bundle:nil] instantiateInitialViewController];
 }
 
+// The Launcher applet sizes itself to its item count: header-less list of shortcut buttons
+// plus the "Edit Shortcuts" button, with insets. Used both as its preferred open size and by
+// -autosizeLauncherWindow when shortcuts are added/removed.
+static CGSize ISHWorkspaceLauncherContentSize(void) {
+    BOOL phone = ISHWorkspaceUsesPhoneLayout();
+    NSUInteger count = ISHWorkspaceLauncherShortcuts().count;
+    CGFloat inset = phone ? 12.0 : 16.0;
+    CGFloat spacing = 8.0;
+    CGFloat rowHeight = phone ? 28.0 : 30.0;
+    CGFloat editHeight = phone ? 40.0 : 44.0;
+    CGFloat width = phone ? 168.0 : 200.0;
+    CGFloat rowsHeight = count > 0 ? (count * rowHeight + (count - 1) * spacing) : (phone ? 28.0 : 32.0);
+    CGFloat height = inset + rowsHeight + spacing + editHeight + inset;
+    return CGSizeMake(width, height);
+}
+
+// The Desktops applet sizes itself to the Desktop count: a vertical list of "Desktop N" rows
+// plus the "New Desktop" button and the Save/Restore row. Used as its preferred/fallback size
+// and by -autosizeWorkspacesWindow when Desktops are added/removed.
+static CGSize ISHWorkspaceWorkspacesContentSize(NSUInteger count) {
+    BOOL phone = ISHWorkspaceUsesPhoneLayout();
+    NSUInteger n = MAX(count, (NSUInteger)1);
+    CGFloat rowHeight = phone ? 34.0 : 38.0;
+    CGFloat newDesktopHeight = phone ? 36.0 : 40.0;
+    CGFloat spacing = 6.0;
+    CGFloat cardPadding = 16.0;
+    CGFloat actionsHeight = phone ? 40.0 : 44.0;
+    CGFloat chrome = phone ? 28.0 : 32.0;
+    CGFloat width = phone ? 200.0 : 220.0;
+    CGFloat rowsHeight = n * rowHeight + n * spacing + newDesktopHeight;
+    CGFloat height = rowsHeight + cardPadding + actionsHeight + chrome;
+    return CGSizeMake(width, height);
+}
+
 static CGSize ISHWorkspacePreferredToolContentSize(NSString *toolIdentifier) {
     if (ISHWorkspaceUsesPhoneLayout()) {
         if ([toolIdentifier isEqualToString:ISHWorkspaceToolClockIdentifier])
@@ -546,7 +697,7 @@ static CGSize ISHWorkspacePreferredToolContentSize(NSString *toolIdentifier) {
         if ([toolIdentifier isEqualToString:ISHWorkspaceToolStatusIdentifier])
             return CGSizeMake(340, 248);
         if ([toolIdentifier isEqualToString:ISHWorkspaceToolWorkspacesIdentifier])
-            return CGSizeMake(220, 118);
+            return ISHWorkspaceWorkspacesContentSize(1);
         if ([toolIdentifier isEqualToString:ISHWorkspaceToolSessionsIdentifier])
             return CGSizeMake(332, 238);
         if ([toolIdentifier isEqualToString:ISHWorkspaceToolStorageIdentifier])
@@ -565,6 +716,8 @@ static CGSize ISHWorkspacePreferredToolContentSize(NSString *toolIdentifier) {
             return CGSizeMake(352, 620);
         if ([toolIdentifier isEqualToString:ISHWorkspaceToolLLMIdentifier])
             return CGSizeMake(352, 560);
+        if ([toolIdentifier isEqualToString:ISHWorkspaceToolLauncherIdentifier])
+            return ISHWorkspaceLauncherContentSize();
         return CGSizeMake(344, 580);
     }
     if ([toolIdentifier isEqualToString:ISHWorkspaceToolClockIdentifier])
@@ -578,7 +731,7 @@ static CGSize ISHWorkspacePreferredToolContentSize(NSString *toolIdentifier) {
     if ([toolIdentifier isEqualToString:ISHWorkspaceToolStatusIdentifier])
         return CGSizeMake(460, 300);
     if ([toolIdentifier isEqualToString:ISHWorkspaceToolWorkspacesIdentifier])
-        return CGSizeMake(252, 138);
+        return ISHWorkspaceWorkspacesContentSize(1);
     if ([toolIdentifier isEqualToString:ISHWorkspaceToolSessionsIdentifier])
         return CGSizeMake(460, 286);
     if ([toolIdentifier isEqualToString:ISHWorkspaceToolStorageIdentifier])
@@ -597,6 +750,8 @@ static CGSize ISHWorkspacePreferredToolContentSize(NSString *toolIdentifier) {
         return CGSizeMake(760, 760);
     if ([toolIdentifier isEqualToString:ISHWorkspaceToolLLMIdentifier])
         return CGSizeMake(560, 620);
+    if ([toolIdentifier isEqualToString:ISHWorkspaceToolLauncherIdentifier])
+        return ISHWorkspaceLauncherContentSize();
     return CGSizeMake(720, 640);
 }
 
@@ -637,9 +792,10 @@ static CGSize ISHWorkspaceMaximumDockContentSize(void) {
 }
 
 static CGSize ISHWorkspaceMinimumTerminalContentSize(void) {
+    // Half the previous minimums, so terminals can be dragged down to ~half their old smallest.
     if (ISHWorkspaceUsesPhoneLayout())
-        return CGSizeMake(300, 220);
-    return CGSizeMake(520, 340);
+        return CGSizeMake(150, 110);
+    return CGSizeMake(260, 170);
 }
 
 static CGSize ISHWorkspaceMinimumToolContentSize(NSString *toolIdentifier) {
@@ -655,7 +811,7 @@ static CGSize ISHWorkspaceMinimumToolContentSize(NSString *toolIdentifier) {
         if ([toolIdentifier isEqualToString:ISHWorkspaceToolStatusIdentifier])
             return CGSizeMake(300, 220);
         if ([toolIdentifier isEqualToString:ISHWorkspaceToolWorkspacesIdentifier])
-            return CGSizeMake(188, 96);
+            return CGSizeMake(110, 108);
         if ([toolIdentifier isEqualToString:ISHWorkspaceToolSessionsIdentifier])
             return CGSizeMake(280, 176);
         if ([toolIdentifier isEqualToString:ISHWorkspaceToolStorageIdentifier])
@@ -674,6 +830,8 @@ static CGSize ISHWorkspaceMinimumToolContentSize(NSString *toolIdentifier) {
             return CGSizeMake(320, 420);
         if ([toolIdentifier isEqualToString:ISHWorkspaceToolLLMIdentifier])
             return CGSizeMake(300, 360);
+        if ([toolIdentifier isEqualToString:ISHWorkspaceToolLauncherIdentifier])
+            return CGSizeMake(200, 80);
         return CGSizeMake(300, 220);
     }
 
@@ -688,7 +846,7 @@ static CGSize ISHWorkspaceMinimumToolContentSize(NSString *toolIdentifier) {
     if ([toolIdentifier isEqualToString:ISHWorkspaceToolStatusIdentifier])
         return CGSizeMake(360, 220);
     if ([toolIdentifier isEqualToString:ISHWorkspaceToolWorkspacesIdentifier])
-        return CGSizeMake(216, 112);
+        return CGSizeMake(124, 116);
     if ([toolIdentifier isEqualToString:ISHWorkspaceToolSessionsIdentifier])
         return CGSizeMake(340, 208);
     if ([toolIdentifier isEqualToString:ISHWorkspaceToolStorageIdentifier])
@@ -701,6 +859,8 @@ static CGSize ISHWorkspaceMinimumToolContentSize(NSString *toolIdentifier) {
         return CGSizeMake(520, 560);
     if ([toolIdentifier isEqualToString:ISHWorkspaceToolLLMIdentifier])
         return CGSizeMake(420, 420);
+    if ([toolIdentifier isEqualToString:ISHWorkspaceToolLauncherIdentifier])
+        return CGSizeMake(220, 96);
     return CGSizeZero;
 }
 
@@ -729,7 +889,7 @@ static NSString *ISHWorkspaceToolTitle(NSString *toolIdentifier) {
     if ([toolIdentifier isEqualToString:ISHWorkspaceToolStatusIdentifier])
         return @"Logs";
     if ([toolIdentifier isEqualToString:ISHWorkspaceToolWorkspacesIdentifier])
-        return @"Workspaces";
+        return @"Desktops";
     if ([toolIdentifier isEqualToString:ISHWorkspaceToolSessionsIdentifier])
         return @"Sessions";
     if ([toolIdentifier isEqualToString:ISHWorkspaceToolStorageIdentifier])
@@ -748,6 +908,8 @@ static NSString *ISHWorkspaceToolTitle(NSString *toolIdentifier) {
         return @"Settings";
     if ([toolIdentifier isEqualToString:ISHWorkspaceToolLLMIdentifier])
         return @"LLM Chat";
+    if ([toolIdentifier isEqualToString:ISHWorkspaceToolLauncherIdentifier])
+        return @"Launcher";
     return @"Window";
 }
 
@@ -1996,6 +2158,9 @@ static BOOL ISHWorkspaceThemeIdentifierIsBuiltIn(NSString *identifier) {
 @interface WorkspaceShortcutsToolViewController : WorkspaceThemedToolViewController
 @end
 
+@interface WorkspaceLauncherToolViewController : WorkspaceThemedToolViewController
+@end
+
 @interface WorkspaceBrowserToolViewController : WorkspaceThemedToolViewController <UITextFieldDelegate, WKNavigationDelegate, WKUIDelegate>
 @end
 
@@ -2038,6 +2203,8 @@ static UIViewController *ISHCreateWorkspaceToolViewController(NSString *toolIden
     }
     if ([toolIdentifier isEqualToString:ISHWorkspaceToolDiagnosticsIdentifier])
         return ISHCreateDiagnosticsViewController();
+    if ([toolIdentifier isEqualToString:ISHWorkspaceToolLauncherIdentifier])
+        return [WorkspaceLauncherToolViewController new];
     return nil;
 }
 
@@ -2062,6 +2229,8 @@ NSString *ISHWorkspaceToolIdentifierForViewController(UIViewController *viewCont
         return ISHWorkspaceToolStorageIdentifier;
     if ([viewController isKindOfClass:WorkspaceShortcutsToolViewController.class])
         return ISHWorkspaceToolShortcutsIdentifier;
+    if ([viewController isKindOfClass:WorkspaceLauncherToolViewController.class])
+        return ISHWorkspaceToolLauncherIdentifier;
     if ([viewController isKindOfClass:WorkspaceBrowserToolViewController.class])
         return ISHWorkspaceToolBrowserIdentifier;
     if ([viewController isKindOfClass:WorkspaceThemesToolViewController.class])
@@ -2519,12 +2688,15 @@ NSString *ISHWorkspaceToolIdentifierForViewController(UIViewController *viewCont
                                                  MAX(1, preferredSize.height)));
     [self.desktopSurfaceView addSubview:windowView];
     [self.desktopWindows addObject:windowView];
+    windowView.workspaceDesktopIndex = self.activeDesktopIndex;
     if (appliesInitialPlacement) {
         [self applyInitialFrameIfNeededToDesktopWindow:windowView];
         [self.desktopSurfaceView bringSubviewToFront:windowView];
     }
     __weak typeof(self) weakSelf = self;
+    __weak typeof(windowView) weakWindowView = windowView;
     windowView.didBecomeFrontmostHandler = ^{
+        [weakWindowView.hostedTerminalViewController focusTerminal];
         [weakSelf refreshDockButtons];
     };
     return windowView;
@@ -2630,6 +2802,7 @@ NSString *ISHWorkspaceToolIdentifierForViewController(UIViewController *viewCont
             descriptor[@"sessionTerminalUUID"] = sessionTerminalUUID.UUIDString;
         if (terminalRole.length > 0)
             descriptor[@"terminalRole"] = terminalRole;
+        descriptor[@"desktopIndex"] = @(windowView.workspaceDesktopIndex);
         return descriptor;
     }
 
@@ -2638,6 +2811,7 @@ NSString *ISHWorkspaceToolIdentifierForViewController(UIViewController *viewCont
             @"kind": ISHWorkspaceSavedLayoutKindTool,
             @"frame": frameDescriptor,
             @"toolIdentifier": windowView.workspaceToolIdentifier,
+            @"desktopIndex": @(windowView.workspaceDesktopIndex),
         };
     }
 
@@ -2763,6 +2937,13 @@ NSString *ISHWorkspaceToolIdentifierForViewController(UIViewController *viewCont
 }
 
 - (ISHWorkspaceContainedWindowView *)openWorkspaceToolWindowWithIdentifier:(NSString *)toolIdentifier {
+    // Global tools (Desktops/Launcher) are singletons shared by every Desktop — reuse the one
+    // window instead of creating a second with its own separate state.
+    if ([self isGlobalToolIdentifier:toolIdentifier]) {
+        ISHWorkspaceContainedWindowView *existing = [self desktopWindowForToolIdentifier:toolIdentifier];
+        if (existing != nil)
+            return existing;
+    }
     UIViewController *viewController = ISHCreateWorkspaceToolViewController(toolIdentifier);
     if (viewController == nil)
         return nil;
@@ -2778,6 +2959,8 @@ NSString *ISHWorkspaceToolIdentifierForViewController(UIViewController *viewCont
                           showsCloseButton:!settingsTool
                     appliesInitialPlacement:!workspacesTool];
     windowView.workspaceToolIdentifier = toolIdentifier;
+    if ([self isGlobalToolIdentifier:toolIdentifier])
+        windowView.workspaceDesktopIndex = 0;  // global singletons live on the first Desktop
     CGSize minimumSize = ISHWorkspaceMinimumToolContentSize(toolIdentifier);
     if (!CGSizeEqualToSize(minimumSize, CGSizeZero)) {
         windowView.resizable = YES;
@@ -2955,10 +3138,15 @@ NSString *ISHWorkspaceToolIdentifierForViewController(UIViewController *viewCont
             NSString *toolIdentifier = descriptor[@"toolIdentifier"];
             if (toolIdentifier.length == 0)
                 continue;
+            // Global singletons (Desktops/Launcher): restore only the first occurrence, ignoring
+            // any saved copies on later Desktops.
+            if ([self isGlobalToolIdentifier:toolIdentifier] && [self desktopWindowForToolIdentifier:toolIdentifier] != nil)
+                continue;
             ISHWorkspaceContainedWindowView *windowView = [self openWorkspaceToolWindowWithIdentifier:toolIdentifier];
             [self applySavedFrameDescriptor:frameDescriptor
                                    toWindow:windowView
                                fallbackSize:ISHWorkspacePreferredToolContentSize(toolIdentifier)];
+            [self assignRestoredWindow:windowView toDesktopFromDescriptor:descriptor];
             continue;
         }
         if ([kind isEqualToString:ISHWorkspaceSavedLayoutKindTerminal]) {
@@ -2980,13 +3168,28 @@ NSString *ISHWorkspaceToolIdentifierForViewController(UIViewController *viewCont
                 [self applySavedFrameDescriptor:frameDescriptor
                                        toWindow:windowView
                                    fallbackSize:ISHWorkspacePreferredTerminalContentSize()];
+                [self assignRestoredWindow:windowView toDesktopFromDescriptor:descriptor];
             }
         }
     }
 
+    [self applyDesktopVisibility];
     [self ensureDefaultWorkspaceUtilitiesOpen];
     [self refreshWorkspaceStatus];
     [self applyCompactSizingToOpenWorkspaceToolWindows];
+}
+
+// Returns the saved tool-window descriptor for a tool identifier in a saved layout, or nil.
+- (NSDictionary<NSString *, id> *)savedLayout:(NSArray<NSDictionary<NSString *, id> *> *)savedLayout
+                    toolDescriptorForIdentifier:(NSString *)toolIdentifier {
+    if (toolIdentifier.length == 0 || ![savedLayout isKindOfClass:NSArray.class])
+        return nil;
+    for (NSDictionary<NSString *, id> *descriptor in savedLayout) {
+        if ([descriptor[@"kind"] isEqualToString:ISHWorkspaceSavedLayoutKindTool] &&
+            [descriptor[@"toolIdentifier"] isEqualToString:toolIdentifier])
+            return descriptor;
+    }
+    return nil;
 }
 
 - (ISHWorkspaceContainedWindowView *)desktopWindowDisplayingTerminalUUID:(NSUUID *)terminalUUID {
@@ -3043,8 +3246,8 @@ NSString *ISHWorkspaceToolIdentifierForViewController(UIViewController *viewCont
         if (![view isKindOfClass:ISHWorkspaceContainedWindowView.class])
             continue;
         ISHWorkspaceContainedWindowView *windowView = (ISHWorkspaceContainedWindowView *) view;
-        if (windowView.hidden)
-            continue;
+        // Don't skip hidden windows: in the Desktop model a tool on another Desktop is hidden,
+        // not closed, and is still "open" — skipping it makes openOrFocus spawn a duplicate.
         if ([windowView.workspaceToolIdentifier isEqualToString:toolIdentifier])
             return windowView;
     }
@@ -3067,7 +3270,558 @@ NSString *ISHWorkspaceToolIdentifierForViewController(UIViewController *viewCont
     if (windowView == nil)
         return;
     [self.desktopSurfaceView bringSubviewToFront:windowView];
+    [windowView.hostedTerminalViewController focusTerminal];
     [self refreshDockButtons];
+}
+
+- (BOOL)gestureRecognizer:(UIGestureRecognizer *)gestureRecognizer shouldReceiveTouch:(UITouch *)touch {
+    // The desktop root menu only fires on the bare desktop, never on a window.
+    if (gestureRecognizer.view == self.desktopSurfaceView)
+        return touch.view == self.desktopSurfaceView || touch.view == self.desktopWallpaperView;
+    return YES;
+}
+
+- (void)handleDesktopLongPress:(UILongPressGestureRecognizer *)recognizer {
+    if (recognizer.state != UIGestureRecognizerStateBegan)
+        return;
+    // Modern-only: the root menu is part of the ctwm-style experience; Classic stays bare.
+    if (!ISHWorkspaceUsesModernStyle())
+        return;
+    CGPoint point = [recognizer locationInView:self.desktopSurfaceView];
+    [self presentDesktopRootMenuFromView:self.desktopSurfaceView sourceRect:CGRectMake(point.x, point.y, 1.0, 1.0)];
+}
+
+- (void)handleDesktopTwoFingerLongPress:(UILongPressGestureRecognizer *)recognizer {
+    if (recognizer.state != UIGestureRecognizerStateBegan)
+        return;
+    if (!ISHWorkspaceUsesModernStyle())
+        return;
+    // Two fingers work anywhere, including on top of a window, so the menu is always
+    // reachable even when windows cover the whole desktop.
+    CGPoint point = [recognizer locationInView:self.desktopSurfaceView];
+    [self presentDesktopRootMenuFromView:self.desktopSurfaceView sourceRect:CGRectMake(point.x, point.y, 1.0, 1.0)];
+}
+
+- (UIButton *)makeModernMenuPip {
+    UIButton *pip = [UIButton buttonWithType:UIButtonTypeSystem];
+    pip.translatesAutoresizingMaskIntoConstraints = NO;
+    if (@available(iOS 13.0, *)) {
+        [pip setImage:[UIImage systemImageNamed:@"line.3.horizontal"] forState:UIControlStateNormal];
+    } else {
+        [pip setTitle:@"☰" forState:UIControlStateNormal];
+    }
+    pip.tintColor = UIColor.whiteColor;
+    [pip setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
+    NSDictionary<NSString *, UIColor *> *pipTheme = ISHWorkspaceThemeDescriptor();
+    pip.backgroundColor = pipTheme[@"accent"] ?: [UIColor colorWithRed:0.20 green:0.48 blue:0.96 alpha:1.0];
+    pip.layer.cornerRadius = 22.0;
+    pip.layer.borderWidth = 1.5;
+    pip.layer.borderColor = [UIColor colorWithWhite:1.0 alpha:0.85].CGColor;
+    pip.layer.shadowColor = UIColor.blackColor.CGColor;
+    pip.layer.shadowOpacity = 0.35;
+    pip.layer.shadowRadius = 6.0;
+    pip.layer.shadowOffset = CGSizeMake(0.0, 2.0);
+    pip.accessibilityLabel = @"Workspace menu";
+    [pip addTarget:self action:@selector(menuPipTapped:) forControlEvents:UIControlEventTouchUpInside];
+    pip.hidden = !ISHWorkspaceUsesModernStyle();
+    return pip;
+}
+
+- (void)menuPipTapped:(UIButton *)sender {
+    [self presentDesktopRootMenuFromView:sender sourceRect:sender.bounds];
+}
+
+- (void)presentIconManagerFromView:(UIView *)sourceView sourceRect:(CGRect)sourceRect {
+    UIAlertController *sheet =
+        [UIAlertController alertControllerWithTitle:@"Windows"
+                                            message:nil
+                                     preferredStyle:UIAlertControllerStyleActionSheet];
+
+    NSUInteger listed = 0;
+    for (ISHWorkspaceContainedWindowView *windowView in self.desktopWindows.copy) {
+        if (![windowView isKindOfClass:ISHWorkspaceContainedWindowView.class] || windowView.hidden)
+            continue;
+        if (windowView == self.dashboardWindow || windowView == self.dockWindow)
+            continue;
+        NSString *name = windowView.titleLabel.text.length > 0 ? windowView.titleLabel.text : @"Window";
+        __weak typeof(self) weakSelf = self;
+        __weak typeof(windowView) weakWindow = windowView;
+        [sheet addAction:[UIAlertAction actionWithTitle:name
+                                                  style:UIAlertActionStyleDefault
+                                                handler:^(__unused UIAlertAction *action) {
+            [weakSelf focusDesktopWindow:weakWindow];
+        }]];
+        listed++;
+    }
+    if (listed == 0) {
+        UIAlertAction *empty = [UIAlertAction actionWithTitle:@"No open windows" style:UIAlertActionStyleDefault handler:nil];
+        empty.enabled = NO;
+        [sheet addAction:empty];
+    }
+    [sheet addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+
+    UIPopoverPresentationController *popover = sheet.popoverPresentationController;
+    if (popover != nil) {
+        popover.sourceView = sourceView;
+        popover.sourceRect = sourceRect;
+        popover.permittedArrowDirections = UIPopoverArrowDirectionAny;
+    }
+    [self presentViewController:sheet animated:YES completion:nil];
+}
+
+// Run a launcher shortcut: a {token} command opens the matching built-in tool; anything else
+// runs in a fresh terminal (an empty command just opens a terminal).
+- (void)runLauncherShortcutWithCommand:(NSString *)command title:(NSString *)title {
+    NSString *toolIdentifier = ISHWorkspaceLauncherToolIdentifierForCommand(command);
+    if (toolIdentifier.length > 0) {
+        [self openOrFocusWorkspaceToolIdentifier:toolIdentifier];
+        return;
+    }
+    [self launchTerminalWithCommand:command title:title];
+}
+
+- (void)launchTerminalWithCommand:(NSString *)command {
+    [self launchTerminalWithCommand:command title:nil];
+}
+
+// An empty command just opens a fresh terminal (so a shortcut named "terminal" with no
+// command gives you a plain shell); a non-empty command is injected once the shell is up.
+- (void)launchTerminalWithCommand:(NSString *)command title:(NSString *)title {
+    NSString *windowTitle = title.length > 0 ? title : (command.length > 0 ? command : @"Terminal");
+    TerminalViewController *terminalViewController = [self createDesktopTerminalViewController];
+    if (terminalViewController == nil) {
+        [self presentSceneActivationError:nil];
+        return;
+    }
+    terminalViewController.freshSessionTerminalDisplayMode = ISHFreshSessionTerminalDisplayModeSessionShell;
+    ISHWorkspaceContainedWindowView *windowView =
+        [self openDesktopTerminalWindowWithTitle:windowTitle terminalViewController:terminalViewController];
+    [terminalViewController startNewSession];
+    [terminalViewController showSessionShellForCurrentSession];
+    windowView.workspaceTerminalRole = ISHWorkspaceTerminalRoleGeneric;
+    windowView.titleLabel.text = windowTitle;
+    [self refreshDockButtons];
+
+    if (command.length == 0)
+        return;
+
+    // Inject the command once the shell has had a moment to come up. The pty buffers
+    // it, so the shell runs it as soon as it starts reading.
+    Terminal *terminal = terminalViewController.terminal;
+    NSData *line = [[command stringByAppendingString:@"\n"] dataUsingEncoding:NSUTF8StringEncoding];
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        [terminal sendInput:line];
+    });
+}
+
+- (void)presentLauncherFromView:(UIView *)sourceView sourceRect:(CGRect)sourceRect {
+    NSArray<NSDictionary<NSString *, NSString *> *> *shortcuts = ISHWorkspaceLauncherShortcuts();
+    UIAlertController *sheet =
+        [UIAlertController alertControllerWithTitle:@"Launcher"
+                                            message:shortcuts.count == 0 ? @"Add a shortcut to run a command in a new terminal." : nil
+                                     preferredStyle:UIAlertControllerStyleActionSheet];
+    for (NSDictionary<NSString *, NSString *> *shortcut in shortcuts) {
+        NSString *command = shortcut[@"command"] ?: @"";
+        NSString *name = shortcut[@"name"].length > 0 ? shortcut[@"name"]
+                       : (command.length > 0 ? command : @"Terminal");
+        [sheet addAction:[UIAlertAction actionWithTitle:name
+                                                  style:UIAlertActionStyleDefault
+                                                handler:^(__unused UIAlertAction *action) {
+            [self runLauncherShortcutWithCommand:command title:name];
+        }]];
+    }
+    [sheet addAction:[UIAlertAction actionWithTitle:@"Show on Desktop"
+                                              style:UIAlertActionStyleDefault
+                                            handler:^(__unused UIAlertAction *action) {
+        [self openOrFocusWorkspaceToolIdentifier:ISHWorkspaceToolLauncherIdentifier];
+    }]];
+    [sheet addAction:[UIAlertAction actionWithTitle:@"Edit Shortcuts…"
+                                              style:UIAlertActionStyleDefault
+                                            handler:^(__unused UIAlertAction *action) {
+        [self presentLauncherEditorFromView:sourceView];
+    }]];
+    [sheet addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+
+    UIPopoverPresentationController *popover = sheet.popoverPresentationController;
+    if (popover != nil) {
+        popover.sourceView = sourceView;
+        popover.sourceRect = sourceRect;
+        popover.permittedArrowDirections = UIPopoverArrowDirectionAny;
+    }
+    [self presentViewController:sheet animated:YES completion:nil];
+}
+
+- (void)presentAddLauncherShortcut {
+    UIAlertController *alert =
+        [UIAlertController alertControllerWithTitle:@"Add Shortcut"
+                                            message:@"A name, and a command to run in a new terminal. Leave it blank for just a terminal, or use a {token} like {clock} or {browser} to open a built-in."
+                                     preferredStyle:UIAlertControllerStyleAlert];
+    [alert addTextFieldWithConfigurationHandler:^(UITextField *textField) {
+        textField.placeholder = @"Name (e.g. skippy or terminal)";
+        textField.autocapitalizationType = UITextAutocapitalizationTypeNone;
+    }];
+    [alert addTextFieldWithConfigurationHandler:^(UITextField *textField) {
+        textField.placeholder = @"Command (e.g. ssh skippy — blank for a shell)";
+        textField.autocapitalizationType = UITextAutocapitalizationTypeNone;
+        textField.autocorrectionType = UITextAutocorrectionTypeNo;
+    }];
+    [alert addAction:[UIAlertAction actionWithTitle:@"Save"
+                                              style:UIAlertActionStyleDefault
+                                            handler:^(__unused UIAlertAction *action) {
+        NSString *command = alert.textFields[1].text ?: @"";
+        NSString *nameField = alert.textFields[0].text ?: @"";
+        if (command.length == 0 && nameField.length == 0)
+            return;
+        NSString *name = nameField.length > 0 ? nameField : command;
+        NSMutableArray<NSDictionary<NSString *, NSString *> *> *shortcuts = [ISHWorkspaceLauncherShortcuts() mutableCopy];
+        [shortcuts addObject:@{@"name": name, @"command": command}];
+        ISHWorkspaceSetLauncherShortcuts(shortcuts);
+    }]];
+    [alert addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+    [self presentViewController:alert animated:YES completion:nil];
+}
+
+// "Edit Shortcuts" entry point: pick a shortcut to edit/delete, or add a new one. Replaces
+// the old separate Add/Remove sheets and is shared by the root-menu Launcher and the applet.
+- (void)presentLauncherEditorFromView:(UIView *)sourceView {
+    NSArray<NSDictionary<NSString *, NSString *> *> *shortcuts = ISHWorkspaceLauncherShortcuts();
+    UIAlertController *sheet =
+        [UIAlertController alertControllerWithTitle:@"Edit Shortcuts"
+                                            message:shortcuts.count == 0 ? @"Add a shortcut to run a command — or just open a terminal." : @"Pick a shortcut to rename, change, or delete."
+                                     preferredStyle:UIAlertControllerStyleActionSheet];
+    [shortcuts enumerateObjectsUsingBlock:^(NSDictionary<NSString *, NSString *> *shortcut, NSUInteger idx, __unused BOOL *stop) {
+        NSString *name = shortcut[@"name"].length > 0 ? shortcut[@"name"]
+                       : (shortcut[@"command"].length > 0 ? shortcut[@"command"] : @"Terminal");
+        [sheet addAction:[UIAlertAction actionWithTitle:name
+                                                  style:UIAlertActionStyleDefault
+                                                handler:^(__unused UIAlertAction *action) {
+            [self presentEditLauncherShortcutAtIndex:idx];
+        }]];
+    }];
+    [sheet addAction:[UIAlertAction actionWithTitle:@"Add Shortcut…"
+                                              style:UIAlertActionStyleDefault
+                                            handler:^(__unused UIAlertAction *action) {
+        [self presentAddLauncherShortcut];
+    }]];
+    [sheet addAction:[UIAlertAction actionWithTitle:@"Add Built-in…"
+                                              style:UIAlertActionStyleDefault
+                                            handler:^(__unused UIAlertAction *action) {
+        [self presentAddLauncherBuiltinFromView:sourceView];
+    }]];
+    [sheet addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+
+    UIPopoverPresentationController *popover = sheet.popoverPresentationController;
+    if (popover != nil) {
+        popover.sourceView = sourceView;
+        popover.sourceRect = sourceView.bounds;
+        popover.permittedArrowDirections = UIPopoverArrowDirectionAny;
+    }
+    [self presentViewController:sheet animated:YES completion:nil];
+}
+
+// Discoverable companion to the {token} syntax: pick a built-in tool and it's added as a
+// shortcut whose command is the matching {token}.
+- (void)presentAddLauncherBuiltinFromView:(UIView *)sourceView {
+    NSMutableArray<NSDictionary<NSString *, NSString *> *> *builtins = [@[
+        @{@"name": @"Web Browser", @"command": @"{browser}"},
+        @{@"name": @"Clock", @"command": @"{clock}"},
+        @{@"name": @"Monitor", @"command": @"{monitor}"},
+        @{@"name": @"Networks", @"command": @"{networks}"},
+        @{@"name": @"Logs", @"command": @"{logs}"},
+        @{@"name": @"Storage", @"command": @"{storage}"},
+        @{@"name": @"Boot Images", @"command": @"{images}"},
+        @{@"name": @"Themes", @"command": @"{themes}"},
+        @{@"name": @"Sessions", @"command": @"{sessions}"},
+        @{@"name": @"Diagnostics", @"command": @"{diagnostics}"},
+        @{@"name": @"Settings", @"command": @"{settings}"},
+    ] mutableCopy];
+    if (ISHLLMClientEnabled())
+        [builtins addObject:@{@"name": @"LLM Chat", @"command": @"{llm}"}];
+
+    UIAlertController *sheet =
+        [UIAlertController alertControllerWithTitle:@"Add Built-in"
+                                            message:@"Open a built-in tool straight from the Launcher."
+                                     preferredStyle:UIAlertControllerStyleActionSheet];
+    for (NSDictionary<NSString *, NSString *> *builtin in builtins) {
+        [sheet addAction:[UIAlertAction actionWithTitle:builtin[@"name"]
+                                                  style:UIAlertActionStyleDefault
+                                                handler:^(__unused UIAlertAction *action) {
+            NSMutableArray<NSDictionary<NSString *, NSString *> *> *shortcuts = [ISHWorkspaceLauncherShortcuts() mutableCopy];
+            [shortcuts addObject:builtin];
+            ISHWorkspaceSetLauncherShortcuts(shortcuts);
+        }]];
+    }
+    [sheet addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+
+    UIPopoverPresentationController *popover = sheet.popoverPresentationController;
+    if (popover != nil) {
+        popover.sourceView = sourceView;
+        popover.sourceRect = sourceView.bounds;
+        popover.permittedArrowDirections = UIPopoverArrowDirectionAny;
+    }
+    [self presentViewController:sheet animated:YES completion:nil];
+}
+
+- (void)presentEditLauncherShortcutAtIndex:(NSUInteger)index {
+    NSArray<NSDictionary<NSString *, NSString *> *> *shortcuts = ISHWorkspaceLauncherShortcuts();
+    if (index >= shortcuts.count)
+        return;
+    NSDictionary<NSString *, NSString *> *shortcut = shortcuts[index];
+    UIAlertController *alert =
+        [UIAlertController alertControllerWithTitle:@"Edit Shortcut"
+                                            message:@"Leave the command blank to just open a terminal."
+                                     preferredStyle:UIAlertControllerStyleAlert];
+    [alert addTextFieldWithConfigurationHandler:^(UITextField *textField) {
+        textField.placeholder = @"Name";
+        textField.text = shortcut[@"name"];
+        textField.autocapitalizationType = UITextAutocapitalizationTypeNone;
+    }];
+    [alert addTextFieldWithConfigurationHandler:^(UITextField *textField) {
+        textField.placeholder = @"Command (blank for a shell)";
+        textField.text = shortcut[@"command"];
+        textField.autocapitalizationType = UITextAutocapitalizationTypeNone;
+        textField.autocorrectionType = UITextAutocorrectionTypeNo;
+    }];
+    [alert addAction:[UIAlertAction actionWithTitle:@"Save"
+                                              style:UIAlertActionStyleDefault
+                                            handler:^(__unused UIAlertAction *action) {
+        NSString *command = alert.textFields[1].text ?: @"";
+        NSString *nameField = alert.textFields[0].text ?: @"";
+        if (command.length == 0 && nameField.length == 0)
+            return;
+        NSString *name = nameField.length > 0 ? nameField : command;
+        NSMutableArray<NSDictionary<NSString *, NSString *> *> *updated = [ISHWorkspaceLauncherShortcuts() mutableCopy];
+        if (index < updated.count)
+            updated[index] = @{@"name": name, @"command": command};
+        ISHWorkspaceSetLauncherShortcuts(updated);
+    }]];
+    [alert addAction:[UIAlertAction actionWithTitle:@"Delete"
+                                              style:UIAlertActionStyleDestructive
+                                            handler:^(__unused UIAlertAction *action) {
+        NSMutableArray<NSDictionary<NSString *, NSString *> *> *updated = [ISHWorkspaceLauncherShortcuts() mutableCopy];
+        if (index < updated.count)
+            [updated removeObjectAtIndex:index];
+        ISHWorkspaceSetLauncherShortcuts(updated);
+    }]];
+    [alert addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+    [self presentViewController:alert animated:YES completion:nil];
+}
+
+// Resize the open Launcher applet to match its current item count (auto-size to content).
+- (void)autosizeLauncherWindow {
+    ISHWorkspaceContainedWindowView *window = [self desktopWindowForToolIdentifier:ISHWorkspaceToolLauncherIdentifier];
+    if (window == nil)
+        return;
+    [self resizeDesktopWindow:window toSize:ISHWorkspaceLauncherContentSize() animated:YES];
+}
+
+// In-app Desktops: a Desktop is a set of contained windows sharing a workspaceDesktopIndex.
+// Only the active Desktop's windows are visible; switching just shows/hides by index (the dock
+// and Layout Manager are global chrome and stay put). Terminals keep running while hidden.
+// The Desktops applet and the Launcher are global singletons — one window shared by every
+// Desktop, never duplicated, so their state (launcher items, the Desktop list) stays consistent.
+- (BOOL)isGlobalToolIdentifier:(NSString *)toolIdentifier {
+    return [toolIdentifier isEqualToString:ISHWorkspaceToolWorkspacesIdentifier] ||
+           [toolIdentifier isEqualToString:ISHWorkspaceToolLauncherIdentifier];
+}
+
+// Defensive: if more than one window exists for a global tool — duplicates created before the
+// singleton guard, or restored from an old layout that had them on several Desktops — keep the
+// first and close the rest so the Launcher / Desktops applet is genuinely one shared instance.
+- (void)collapseGlobalToolDuplicates {
+    for (NSString *toolIdentifier in @[ISHWorkspaceToolWorkspacesIdentifier, ISHWorkspaceToolLauncherIdentifier]) {
+        ISHWorkspaceContainedWindowView *kept = nil;
+        for (UIView *view in self.desktopWindows.copy) {
+            if (![view isKindOfClass:ISHWorkspaceContainedWindowView.class])
+                continue;
+            ISHWorkspaceContainedWindowView *windowView = (ISHWorkspaceContainedWindowView *) view;
+            if (![windowView.workspaceToolIdentifier isEqualToString:toolIdentifier])
+                continue;
+            if (kept == nil) {
+                kept = windowView;
+                windowView.workspaceDesktopIndex = 0;
+                windowView.hidden = NO;
+            } else if (windowView.closeHandler != nil) {
+                windowView.closeHandler();
+            }
+        }
+    }
+}
+
+- (void)applyDesktopVisibility {
+    [self collapseGlobalToolDuplicates];
+    for (UIView *view in self.desktopWindows) {
+        if (![view isKindOfClass:ISHWorkspaceContainedWindowView.class])
+            continue;
+        ISHWorkspaceContainedWindowView *windowView = (ISHWorkspaceContainedWindowView *) view;
+        if (windowView == self.dockWindow || windowView == self.dashboardWindow)
+            continue;
+        // Global chrome appears on every Desktop, brought to front so it isn't covered.
+        if ([self isGlobalToolIdentifier:windowView.workspaceToolIdentifier]) {
+            windowView.hidden = NO;
+            [self.desktopSurfaceView bringSubviewToFront:windowView];
+            continue;
+        }
+        windowView.hidden = (windowView.workspaceDesktopIndex != self.activeDesktopIndex);
+    }
+}
+
+// Put a restored window back on its saved Desktop, growing the Desktop count to fit.
+- (void)assignRestoredWindow:(ISHWorkspaceContainedWindowView *)windowView toDesktopFromDescriptor:(NSDictionary<NSString *, id> *)descriptor {
+    if (windowView == nil)
+        return;
+    if ([self isGlobalToolIdentifier:windowView.workspaceToolIdentifier]) {
+        windowView.workspaceDesktopIndex = 0;  // global singletons aren't tied to a Desktop
+        return;
+    }
+    NSInteger index = MAX((NSInteger)0, [descriptor[@"desktopIndex"] integerValue]);
+    windowView.workspaceDesktopIndex = index;
+    if (index + 1 > self.desktopCount)
+        self.desktopCount = index + 1;
+}
+
+- (void)postDesktopsDidChange {
+    [NSNotificationCenter.defaultCenter postNotificationName:ISHWorkspaceDesktopsDidChangeNotification object:self];
+}
+
+- (void)switchToDesktopIndex:(NSInteger)index {
+    index = MAX((NSInteger)0, MIN(index, self.desktopCount - 1));
+    if (index == self.activeDesktopIndex)
+        return;
+    self.activeDesktopIndex = index;
+    [self applyDesktopVisibility];
+    [self showDesktopIndicator];
+    [self postDesktopsDidChange];
+}
+
+- (void)createNewDesktop {
+    self.desktopCount += 1;
+    [self switchToDesktopIndex:self.desktopCount - 1];
+    [self postDesktopsDidChange];
+}
+
+- (void)removeDesktopAtIndex:(NSInteger)indexToRemove {
+    if (self.desktopCount <= 1)
+        return;
+    indexToRemove = MAX((NSInteger)0, MIN(indexToRemove, self.desktopCount - 1));
+    // Close the removed Desktop's windows; shift higher Desktops down. Global tools stay put.
+    for (UIView *view in self.desktopWindows.copy) {
+        if (![view isKindOfClass:ISHWorkspaceContainedWindowView.class])
+            continue;
+        ISHWorkspaceContainedWindowView *windowView = (ISHWorkspaceContainedWindowView *) view;
+        if (windowView == self.dockWindow || windowView == self.dashboardWindow)
+            continue;
+        if ([self isGlobalToolIdentifier:windowView.workspaceToolIdentifier])
+            continue;
+        if (windowView.workspaceDesktopIndex == indexToRemove) {
+            if (windowView.closeHandler != nil)
+                windowView.closeHandler();
+        } else if (windowView.workspaceDesktopIndex > indexToRemove) {
+            windowView.workspaceDesktopIndex -= 1;
+        }
+    }
+    self.desktopCount -= 1;
+    if (self.activeDesktopIndex >= self.desktopCount)
+        self.activeDesktopIndex = self.desktopCount - 1;
+    else if (self.activeDesktopIndex > indexToRemove)
+        self.activeDesktopIndex -= 1;
+    [self applyDesktopVisibility];
+    [self postDesktopsDidChange];
+}
+
+- (void)handleDesktopSwitchSwipe:(UISwipeGestureRecognizer *)recognizer {
+    NSInteger delta = recognizer.direction == UISwipeGestureRecognizerDirectionLeft ? 1 : -1;
+    [self switchToDesktopIndex:self.activeDesktopIndex + delta];
+}
+
+// A brief "Desktop N / M" toast so the swipe-only switch stays oriented.
+- (void)showDesktopIndicator {
+    if (self.desktopIndicatorLabel == nil) {
+        UILabel *label = [UILabel new];
+        label.translatesAutoresizingMaskIntoConstraints = NO;
+        label.textAlignment = NSTextAlignmentCenter;
+        label.font = [UIFont systemFontOfSize:15.0 weight:UIFontWeightSemibold];
+        label.textColor = UIColor.whiteColor;
+        label.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.55];
+        label.layer.cornerRadius = 14.0;
+        label.layer.masksToBounds = YES;
+        label.userInteractionEnabled = NO;
+        [self.view addSubview:label];
+        [NSLayoutConstraint activateConstraints:@[
+            [label.centerXAnchor constraintEqualToAnchor:self.view.centerXAnchor],
+            [label.topAnchor constraintEqualToAnchor:self.view.safeAreaLayoutGuide.topAnchor constant:12.0],
+            [label.heightAnchor constraintEqualToConstant:28.0],
+            [label.widthAnchor constraintGreaterThanOrEqualToConstant:130.0],
+        ]];
+        self.desktopIndicatorLabel = label;
+    }
+    self.desktopIndicatorLabel.text =
+        [NSString stringWithFormat:@"  Desktop %ld / %ld  ", (long)(self.activeDesktopIndex + 1), (long)self.desktopCount];
+    [self.view bringSubviewToFront:self.desktopIndicatorLabel];
+    self.desktopIndicatorLabel.hidden = NO;
+    self.desktopIndicatorLabel.alpha = 1.0;
+    [UIView animateWithDuration:0.3 delay:0.7 options:UIViewAnimationOptionBeginFromCurrentState animations:^{
+        self.desktopIndicatorLabel.alpha = 0.0;
+    } completion:nil];
+}
+
+- (void)presentDesktopRootMenuFromView:(UIView *)sourceView sourceRect:(CGRect)sourceRect {
+    UIAlertController *sheet =
+        [UIAlertController alertControllerWithTitle:@"Workspace"
+                                            message:nil
+                                     preferredStyle:UIAlertControllerStyleActionSheet];
+
+    [sheet addAction:[UIAlertAction actionWithTitle:@"New Terminal"
+                                              style:UIAlertActionStyleDefault
+                                            handler:^(__unused UIAlertAction *action) {
+        [self openDesktopTerminalHerePreferringConsole:NO
+                                         reuseExisting:NO
+                                       trackPrimaryRole:NO];
+    }]];
+    [sheet addAction:[UIAlertAction actionWithTitle:@"Terminal…"
+                                              style:UIAlertActionStyleDefault
+                                            handler:^(__unused UIAlertAction *action) {
+        [self presentTerminalDockActionsFromView:sourceView];
+    }]];
+    [sheet addAction:[UIAlertAction actionWithTitle:@"Launcher"
+                                              style:UIAlertActionStyleDefault
+                                            handler:^(__unused UIAlertAction *action) {
+        [self presentLauncherFromView:sourceView sourceRect:sourceRect];
+    }]];
+    [sheet addAction:[UIAlertAction actionWithTitle:@"Windows"
+                                              style:UIAlertActionStyleDefault
+                                            handler:^(__unused UIAlertAction *action) {
+        [self presentIconManagerFromView:sourceView sourceRect:sourceRect];
+    }]];
+    [sheet addAction:[UIAlertAction actionWithTitle:@"New Desktop"
+                                              style:UIAlertActionStyleDefault
+                                            handler:^(__unused UIAlertAction *action) {
+        [self createNewDesktop];
+    }]];
+    [sheet addAction:[UIAlertAction actionWithTitle:@"Utilities…"
+                                              style:UIAlertActionStyleDefault
+                                            handler:^(__unused UIAlertAction *action) {
+        [self presentUtilsDockActionsFromView:self.desktopSurfaceView];
+    }]];
+    [sheet addAction:[UIAlertAction actionWithTitle:@"Settings"
+                                              style:UIAlertActionStyleDefault
+                                            handler:^(__unused UIAlertAction *action) {
+        [self openOrFocusWorkspaceToolIdentifier:ISHWorkspaceToolSettingsIdentifier];
+    }]];
+    [sheet addAction:[UIAlertAction actionWithTitle:@"Workspace Style…"
+                                              style:UIAlertActionStyleDefault
+                                            handler:^(__unused UIAlertAction *action) {
+        [self presentWorkspaceStyleChooserFromView:self.desktopSurfaceView];
+    }]];
+    [sheet addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+
+    UIPopoverPresentationController *popover = sheet.popoverPresentationController;
+    if (popover != nil) {
+        popover.sourceView = sourceView;
+        popover.sourceRect = sourceRect;
+        popover.permittedArrowDirections = UIPopoverArrowDirectionAny;
+    }
+    [self presentViewController:sheet animated:YES completion:nil];
 }
 
 - (ISHWorkspaceContainedWindowView *)desktopWindowHostingTerminalUUID:(NSUUID *)terminalUUID {
@@ -3106,9 +3860,22 @@ NSString *ISHWorkspaceToolIdentifierForViewController(UIViewController *viewCont
                                                  terminalViewController:(TerminalViewController *)terminalViewController {
     CGSize preferredSize = ISHWorkspacePreferredTerminalContentSize();
     terminalViewController.preferredContentSize = preferredSize;
+    // Default open: a window scaled to orientation so terminals don't dominate. In landscape,
+    // half the usable width x half the height (a quadrant); in portrait, the full usable width
+    // x 1/4 the height (a wide strip). Both iPad and iPhone. Clamped/placed by
+    // desktopFrameForWindowWithPreferredSize; the window stays user-resizable down to
+    // ISHWorkspaceMinimumTerminalContentSize.
+    CGSize windowSize = preferredSize;
+    CGRect usable = [self desktopUsableBounds];
+    if (CGRectGetWidth(usable) > 1.0 && CGRectGetHeight(usable) > 1.0) {
+        BOOL landscape = CGRectGetWidth(usable) >= CGRectGetHeight(usable);
+        windowSize = landscape
+            ? CGSizeMake(CGRectGetWidth(usable) / 2.0, CGRectGetHeight(usable) / 2.0)
+            : CGSizeMake(CGRectGetWidth(usable), CGRectGetHeight(usable) / 4.0);
+    }
     ISHWorkspaceContainedWindowView *windowView =
         [self createDesktopWindowWithTitle:title
-                             preferredSize:preferredSize
+                             preferredSize:windowSize
                           showsCloseButton:YES];
     windowView.hostedTerminalViewController = terminalViewController;
     windowView.resizable = YES;
@@ -3136,6 +3903,26 @@ NSString *ISHWorkspaceToolIdentifierForViewController(UIViewController *viewCont
         [self.bodyStack addArrangedSubview:self.windowCard];
 }
 
+- (void)applyWorkspaceDesktopBackground {
+    self.modernMenuPip.hidden = !ISHWorkspaceUsesModernStyle();
+    // Modern hides the dock and the standalone Layout Manager — replaced by the root menu
+    // and the Workspaces applet (which now carries Save/Restore).
+    self.dockWindow.hidden = ISHWorkspaceUsesModernStyle();
+    if (ISHWorkspaceUsesModernStyle())
+        self.dashboardWindow.hidden = YES;
+    if (ISHWorkspaceUsesModernStyle()) {
+        // Modern: a calm flat desktop that follows the user's light/dark choice,
+        // so the whole canvas changes — not just the window frames.
+        self.desktopSurfaceView.backgroundColor = UserPreferences.shared.requestingDarkAppearance
+            ? [UIColor colorWithRed:0.07 green:0.08 blue:0.11 alpha:1.0]
+            : [UIColor colorWithRed:0.92 green:0.93 blue:0.96 alpha:1.0];
+    } else if (@available(iOS 13.0, *)) {
+        self.desktopSurfaceView.backgroundColor = [UIColor.systemGroupedBackgroundColor colorWithAlphaComponent:1.0];
+    } else {
+        self.desktopSurfaceView.backgroundColor = [UIColor colorWithWhite:0.92 alpha:1.0];
+    }
+}
+
 - (void)viewDidLoad {
     [super viewDidLoad];
     self.title = @"Desktop";
@@ -3145,15 +3932,43 @@ NSString *ISHWorkspaceToolIdentifierForViewController(UIViewController *viewCont
         self.view.backgroundColor = UIColor.whiteColor;
     }
     self.desktopWindows = [NSMutableArray array];
+    self.activeDesktopIndex = 0;
+    self.desktopCount = MAX((NSInteger)1, UserPreferences.shared.workspaceLaunchCount);
 
     self.desktopSurfaceView = [UIView new];
     self.desktopSurfaceView.translatesAutoresizingMaskIntoConstraints = NO;
-    if (@available(iOS 13.0, *)) {
-        self.desktopSurfaceView.backgroundColor = [UIColor.systemGroupedBackgroundColor colorWithAlphaComponent:1.0];
-    } else {
-        self.desktopSurfaceView.backgroundColor = [UIColor colorWithWhite:0.92 alpha:1.0];
-    }
+    [self applyWorkspaceDesktopBackground];
     [self.view addSubview:self.desktopSurfaceView];
+
+    UILongPressGestureRecognizer *desktopRootMenuRecognizer =
+        [[UILongPressGestureRecognizer alloc] initWithTarget:self action:@selector(handleDesktopLongPress:)];
+    desktopRootMenuRecognizer.minimumPressDuration = 0.4;
+    desktopRootMenuRecognizer.delegate = self;
+    [self.desktopSurfaceView addGestureRecognizer:desktopRootMenuRecognizer];
+
+    UILongPressGestureRecognizer *desktopTwoFingerMenuRecognizer =
+        [[UILongPressGestureRecognizer alloc] initWithTarget:self action:@selector(handleDesktopTwoFingerLongPress:)];
+    desktopTwoFingerMenuRecognizer.minimumPressDuration = 0.4;
+    desktopTwoFingerMenuRecognizer.numberOfTouchesRequired = 2;
+    [self.view addGestureRecognizer:desktopTwoFingerMenuRecognizer];
+
+    // Two-finger horizontal swipe switches between in-app Desktops.
+    for (NSNumber *direction in @[@(UISwipeGestureRecognizerDirectionLeft), @(UISwipeGestureRecognizerDirectionRight)]) {
+        UISwipeGestureRecognizer *swipe =
+            [[UISwipeGestureRecognizer alloc] initWithTarget:self action:@selector(handleDesktopSwitchSwipe:)];
+        swipe.direction = (UISwipeGestureRecognizerDirection) direction.unsignedIntegerValue;
+        swipe.numberOfTouchesRequired = 2;
+        [self.view addGestureRecognizer:swipe];
+    }
+
+    self.modernMenuPip = [self makeModernMenuPip];
+    [self.view addSubview:self.modernMenuPip];
+    [NSLayoutConstraint activateConstraints:@[
+        [self.modernMenuPip.trailingAnchor constraintEqualToAnchor:self.view.safeAreaLayoutGuide.trailingAnchor constant:-16.0],
+        [self.modernMenuPip.bottomAnchor constraintEqualToAnchor:self.view.safeAreaLayoutGuide.bottomAnchor constant:-16.0],
+        [self.modernMenuPip.widthAnchor constraintEqualToConstant:44.0],
+        [self.modernMenuPip.heightAnchor constraintEqualToConstant:44.0],
+    ]];
 
     [NSLayoutConstraint activateConstraints:@[
         [self.desktopSurfaceView.topAnchor constraintEqualToAnchor:self.view.topAnchor],
@@ -3190,6 +4005,9 @@ NSString *ISHWorkspaceToolIdentifierForViewController(UIViewController *viewCont
         [weakSelf refreshDockButtons];
     };
     [self createDockWindow];
+    self.dockWindow.hidden = ISHWorkspaceUsesModernStyle();
+    if (ISHWorkspaceUsesModernStyle())
+        self.dashboardWindow.hidden = YES;
 
     UIScrollView *scrollView = [UIScrollView new];
     scrollView.translatesAutoresizingMaskIntoConstraints = NO;
@@ -3210,7 +4028,7 @@ NSString *ISHWorkspaceToolIdentifierForViewController(UIViewController *viewCont
                                                                     selector:@selector(saveWorkspaceLayout:)]];
     [windowCardStack addArrangedSubview:[self workspaceActionButtonWithTitle:@"Restore Saved Layout"
                                                                    selector:@selector(restoreWorkspaceLayout:)]];
-    if (ISHWorkspaceSupportsSceneWindows()) {
+    if (ISHWorkspaceSupportsSceneWindows() && !ISHWorkspaceUsesModernStyle()) {
         [windowCardStack addArrangedSubview:[self workspaceActionButtonWithTitle:@"New Workspace Window"
                                                                        selector:@selector(openNewWorkspaceWindow:)]];
     }
@@ -3275,6 +4093,16 @@ NSString *ISHWorkspaceToolIdentifierForViewController(UIViewController *viewCont
                                                  object:nil];
     }
 
+    [UserPreferences.shared observe:@[@"workspaceStyle", @"colorScheme"]
+                            options:0 owner:self usingBlock:^(typeof(self) self) {
+        // Re-skin every open window and the desktop when the Classic/Modern style is
+        // switched from anywhere (Settings, the dock menu, or the guest `defaults` tool).
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [self applyWorkspaceDesktopBackground];
+            [self refreshDockButtons];
+        });
+    }];
+
     [self refreshWorkspaceStatus];
     [self refreshDockButtons];
 }
@@ -3326,8 +4154,22 @@ NSString *ISHWorkspaceToolIdentifierForViewController(UIViewController *viewCont
     }
     if (!self.didEnsureDefaultWorkspaceUtilities) {
         self.didEnsureDefaultWorkspaceUtilities = YES;
+        NSArray<NSDictionary<NSString *, id> *> *savedLayout = [self savedWorkspaceLayoutForCurrentScene];
+        BOOL hasSavedLayout = [savedLayout isKindOfClass:NSArray.class] && savedLayout.count > 0;
         [self ensureDefaultWorkspaceUtilitiesOpen];
-        [self ensureDefaultLLMChatWindowOpenIfNeeded];
+        // Honor a saved arrangement: don't force the LLM chat back open if it was closed before
+        // saving, and reopen the Launcher (at its saved spot) if it was shown on the desktop.
+        if (!hasSavedLayout || [self savedLayout:savedLayout toolDescriptorForIdentifier:ISHWorkspaceToolLLMIdentifier] != nil)
+            [self ensureDefaultLLMChatWindowOpenIfNeeded];
+        NSDictionary<NSString *, id> *launcherDescriptor =
+            hasSavedLayout ? [self savedLayout:savedLayout toolDescriptorForIdentifier:ISHWorkspaceToolLauncherIdentifier] : nil;
+        if (launcherDescriptor != nil && [self desktopWindowForToolIdentifier:ISHWorkspaceToolLauncherIdentifier] == nil) {
+            ISHWorkspaceContainedWindowView *launcherWindow = [self openWorkspaceToolWindowWithIdentifier:ISHWorkspaceToolLauncherIdentifier];
+            [self applySavedFrameDescriptor:launcherDescriptor[@"frame"]
+                                   toWindow:launcherWindow
+                               fallbackSize:ISHWorkspacePreferredToolContentSize(ISHWorkspaceToolLauncherIdentifier)];
+        }
+        [self applyDesktopVisibility];
     }
     if (self.dockWindow != nil) {
         [self applyInitialPlacementToDockWindow:self.dockWindow];
@@ -3609,6 +4451,18 @@ NSString *ISHWorkspaceToolIdentifierForViewController(UIViewController *viewCont
             continue;
         BOOL activeWindow = windowView == self.desktopSurfaceView.subviews.lastObject;
         [windowView applyWorkspaceChromeTheme:theme active:activeWindow];
+        if (ISHWorkspaceUsesModernStyle()) {
+            // In Modern, the window's upper-right utility button becomes the ☰ menu —
+            // a per-window way to summon the root menu (the dock replacement).
+            __weak typeof(self) weakSelf = self;
+            __weak typeof(windowView) weakWindow = windowView;
+            [windowView setUtilityButtonTitle:@"☰" handler:^{
+                [weakSelf presentDesktopRootMenuFromView:weakWindow.utilityButton
+                                              sourceRect:weakWindow.utilityButton.bounds];
+            }];
+        } else {
+            [windowView setUtilityButtonTitle:nil handler:nil];
+        }
     }
 }
 
@@ -3636,8 +4490,7 @@ NSString *ISHWorkspaceToolIdentifierForViewController(UIViewController *viewCont
 }
 
 - (void)openWorkspaceToolWithIdentifier:(NSString *)toolIdentifier {
-    if ([toolIdentifier isEqualToString:ISHWorkspaceToolWorkspacesIdentifier] && !ISHWorkspaceSupportsSceneWindows())
-        return;
+    // The Desktops applet manages in-app Desktops, available on every device (incl. iPhone).
     if ([toolIdentifier isEqualToString:ISHWorkspaceToolWorkspacesIdentifier]) {
         ISHWorkspaceContainedWindowView *existingWindow = [self desktopWindowForToolIdentifier:toolIdentifier];
         if (existingWindow != nil) {
@@ -3768,6 +4621,16 @@ NSString *ISHWorkspaceToolIdentifierForViewController(UIViewController *viewCont
     }
 }
 
+// Resize the open Desktops applet to match the Desktop count (keeps its restored origin).
+- (void)autosizeWorkspacesWindow {
+    ISHWorkspaceContainedWindowView *window = [self desktopWindowForToolIdentifier:ISHWorkspaceToolWorkspacesIdentifier];
+    if (window == nil)
+        return;
+    [self resizeDesktopWindow:window
+                       toSize:ISHWorkspaceWorkspacesContentSize((NSUInteger)MAX((NSInteger)1, self.desktopCount))
+                     animated:NO];
+}
+
 - (void)openDiagnostics:(id)sender {
     [self openWorkspaceToolWithIdentifier:ISHWorkspaceToolDiagnosticsIdentifier];
 }
@@ -3802,6 +4665,10 @@ NSString *ISHWorkspaceToolIdentifierForViewController(UIViewController *viewCont
         return;
     ISHWorkspaceContainedWindowView *existingWindow = [self desktopWindowForToolIdentifier:toolIdentifier];
     if (existingWindow != nil) {
+        // Summon the existing tool to the current Desktop and reveal it (it may have been on
+        // another Desktop, i.e. hidden) instead of spawning a duplicate.
+        existingWindow.workspaceDesktopIndex = self.activeDesktopIndex;
+        existingWindow.hidden = NO;
         [self focusDesktopWindow:existingWindow];
         return;
     }
@@ -3810,10 +4677,10 @@ NSString *ISHWorkspaceToolIdentifierForViewController(UIViewController *viewCont
 
 - (NSArray<NSDictionary<NSString *, id> *> *)dockUtilityGroupDescriptors {
     NSMutableArray<NSDictionary<NSString *, id> *> *workspaceItems = [NSMutableArray arrayWithObject:@{@"title": @"Layout Manager", @"identifier": @"dashboard"}];
-    if (ISHWorkspaceSupportsSceneWindows()) {
-        [workspaceItems addObject:@{@"title": @"Workspaces", @"identifier": ISHWorkspaceToolWorkspacesIdentifier}];
-    }
+    // Desktops are in-app (not iOS scenes), so the applet is available on every device.
+    [workspaceItems addObject:@{@"title": @"Desktops", @"identifier": ISHWorkspaceToolWorkspacesIdentifier}];
     [workspaceItems addObjectsFromArray:@[
+        @{@"title": @"Launcher", @"identifier": ISHWorkspaceToolLauncherIdentifier},
         @{@"title": @"Quick Actions", @"identifier": ISHWorkspaceToolShortcutsIdentifier},
         @{@"title": @"Browser", @"identifier": ISHWorkspaceToolBrowserIdentifier},
         @{@"title": @"Sessions", @"identifier": ISHWorkspaceToolSessionsIdentifier},
@@ -3927,9 +4794,58 @@ NSString *ISHWorkspaceToolIdentifierForViewController(UIViewController *viewCont
         }]];
     }
 
+    NSString *workspaceStyleTitle = ISHWorkspaceUsesModernStyle() ? @"Modern" : @"Classic";
+    [sheet addAction:[UIAlertAction actionWithTitle:[NSString stringWithFormat:@"Workspace Style: %@", workspaceStyleTitle]
+                                              style:UIAlertActionStyleDefault
+                                            handler:^(__unused UIAlertAction *action) {
+        [self presentWorkspaceStyleChooserFromView:sourceView];
+    }]];
+
     [sheet addAction:[UIAlertAction actionWithTitle:@"Cancel"
                                               style:UIAlertActionStyleCancel
                                             handler:nil]];
+
+    UIPopoverPresentationController *popoverPresentationController = sheet.popoverPresentationController;
+    if (popoverPresentationController != nil) {
+        popoverPresentationController.sourceView = sourceView ?: self.dockUtilsButton;
+        popoverPresentationController.sourceRect = sourceView != nil ? sourceView.bounds : self.dockUtilsButton.bounds;
+        popoverPresentationController.permittedArrowDirections = UIPopoverArrowDirectionAny;
+    }
+    [self presentViewController:sheet animated:YES completion:nil];
+}
+
+- (void)presentWorkspaceStyleChooserFromView:(UIView *)sourceView {
+    UserPreferences *preferences = UserPreferences.shared;
+    UIAlertController *sheet =
+        [UIAlertController alertControllerWithTitle:@"Workspace Style"
+                                            message:@"Pick the Classic or Modern workspace experience. Both stay available; this only changes how the desktop and its windows look and behave."
+                                     preferredStyle:UIAlertControllerStyleActionSheet];
+
+    NSArray<NSNumber *> *styles = @[@(WorkspaceStyleClassic), @(WorkspaceStyleModern)];
+    NSDictionary<NSNumber *, NSString *> *styleTitles = @{
+        @(WorkspaceStyleClassic): @"Classic",
+        @(WorkspaceStyleModern): @"Modern",
+    };
+    for (NSNumber *style in styles) {
+        BOOL selected = preferences.workspaceStyle == (WorkspaceStyle) style.integerValue;
+        NSString *actionTitle = selected
+            ? [NSString stringWithFormat:@"✓ %@", styleTitles[style]]
+            : styleTitles[style];
+        [sheet addAction:[UIAlertAction actionWithTitle:actionTitle
+                                                  style:UIAlertActionStyleDefault
+                                                handler:^(__unused UIAlertAction *action) {
+            preferences.workspaceStyle = (WorkspaceStyle) style.integerValue;
+            // Re-skin every open window immediately. Modern currently mirrors Classic, so
+            // this is a no-op visual change until the Modern skin rung lands.
+            [self refreshDockButtons];
+        }]];
+    }
+
+    [sheet addAction:[UIAlertAction actionWithTitle:@"Back"
+                                              style:UIAlertActionStyleCancel
+                                            handler:^(__unused UIAlertAction *action) {
+        [self presentUtilsDockActionsFromView:sourceView];
+    }]];
 
     UIPopoverPresentationController *popoverPresentationController = sheet.popoverPresentationController;
     if (popoverPresentationController != nil) {
@@ -5982,6 +6898,143 @@ NSString *ISHWorkspaceToolIdentifierForViewController(UIViewController *viewCont
 
 @end
 
+@implementation WorkspaceLauncherToolViewController {
+    UIScrollView *_scrollView;
+    UIStackView *_contentStack;
+}
+
+- (void)viewDidLoad {
+    [super viewDidLoad];
+    self.title = @"Launcher";
+
+    _scrollView = [UIScrollView new];
+    _scrollView.translatesAutoresizingMaskIntoConstraints = NO;
+    [self.toolContentView addSubview:_scrollView];
+
+    _contentStack = [UIStackView new];
+    _contentStack.translatesAutoresizingMaskIntoConstraints = NO;
+    _contentStack.axis = UILayoutConstraintAxisVertical;
+    _contentStack.spacing = 8;
+    [_scrollView addSubview:_contentStack];
+
+    CGFloat inset = ISHWorkspaceUsesPhoneLayout() ? 12.0 : 16.0;
+    [NSLayoutConstraint activateConstraints:@[
+        [_scrollView.topAnchor constraintEqualToAnchor:self.toolContentView.topAnchor],
+        [_scrollView.leadingAnchor constraintEqualToAnchor:self.toolContentView.leadingAnchor],
+        [_scrollView.trailingAnchor constraintEqualToAnchor:self.toolContentView.trailingAnchor],
+        [_scrollView.bottomAnchor constraintEqualToAnchor:self.toolContentView.bottomAnchor],
+        [_contentStack.topAnchor constraintEqualToAnchor:_scrollView.topAnchor constant:inset],
+        [_contentStack.leadingAnchor constraintEqualToAnchor:_scrollView.leadingAnchor constant:inset],
+        [_contentStack.trailingAnchor constraintEqualToAnchor:_scrollView.trailingAnchor constant:-inset],
+        [_contentStack.bottomAnchor constraintEqualToAnchor:_scrollView.bottomAnchor constant:-inset],
+        [_contentStack.widthAnchor constraintEqualToAnchor:_scrollView.widthAnchor constant:-(inset * 2.0)],
+    ]];
+
+    [self rebuildLauncherList];
+    [NSNotificationCenter.defaultCenter addObserver:self
+                                           selector:@selector(launcherShortcutsDidChange)
+                                               name:ISHWorkspaceLauncherShortcutsDidChangeNotification
+                                             object:nil];
+}
+
+- (void)dealloc {
+    [NSNotificationCenter.defaultCenter removeObserver:self];
+}
+
+- (void)launcherShortcutsDidChange {
+    [self rebuildLauncherList];
+    // Grow/shrink the window to match the new item count.
+    [(id)self.workspaceHostViewController autosizeLauncherWindow];
+}
+
+- (UIColor *)launcherColorForKey:(NSString *)key fallback:(UIColor *)fallback {
+    UIColor *color = self.workspaceTheme[key];
+    return color != nil ? color : fallback;
+}
+
+- (void)rebuildLauncherList {
+    for (UIView *view in [_contentStack.arrangedSubviews copy]) {
+        [_contentStack removeArrangedSubview:view];
+        [view removeFromSuperview];
+    }
+
+    NSArray<NSDictionary<NSString *, NSString *> *> *shortcuts = ISHWorkspaceLauncherShortcuts();
+    if (shortcuts.count == 0) {
+        UILabel *empty = [self workspaceThemeSecondaryLabelWithTextStyle:UIFontTextStyleFootnote monospaced:NO];
+        empty.numberOfLines = 0;
+        empty.text = @"No shortcuts yet.";
+        [_contentStack addArrangedSubview:empty];
+    } else {
+        NSUInteger index = 0;
+        for (NSDictionary<NSString *, NSString *> *shortcut in shortcuts) {
+            [_contentStack addArrangedSubview:[self launcherButtonForShortcut:shortcut index:index]];
+            index++;
+        }
+    }
+
+    [_contentStack addArrangedSubview:[self launcherEditButton]];
+}
+
+- (UIButton *)launcherButtonForShortcut:(NSDictionary<NSString *, NSString *> *)shortcut index:(NSUInteger)index {
+    NSString *command = shortcut[@"command"] ?: @"";
+    NSString *name = shortcut[@"name"].length > 0 ? shortcut[@"name"]
+                   : (command.length > 0 ? command : @"Terminal");
+
+    UIButton *run = [UIButton buttonWithType:UIButtonTypeSystem];
+    run.translatesAutoresizingMaskIntoConstraints = NO;
+    run.tag = (NSInteger)index;
+    run.contentEdgeInsets = UIEdgeInsetsMake(2, 3, 2, 3);
+    run.contentHorizontalAlignment = UIControlContentHorizontalAlignmentCenter;
+    run.titleLabel.numberOfLines = 0;
+    run.layer.cornerRadius = 12;
+    run.layer.borderWidth = 1;
+    run.layer.borderColor = [self launcherColorForKey:@"stroke" fallback:[UIColor colorWithWhite:0.5 alpha:0.35]].CGColor;
+    run.backgroundColor = [[self launcherColorForKey:@"cardAlt" fallback:[UIColor colorWithWhite:0.5 alpha:0.12]] colorWithAlphaComponent:0.5];
+    CGFloat minHeight = ISHWorkspaceUsesPhoneLayout() ? 28.0 : 30.0;
+    [run.heightAnchor constraintGreaterThanOrEqualToConstant:minHeight].active = YES;
+
+    NSMutableParagraphStyle *style = [NSMutableParagraphStyle new];
+    style.alignment = NSTextAlignmentCenter;
+    UIColor *primary = [self launcherColorForKey:@"primary" fallback:UIColor.darkTextColor];
+    NSAttributedString *label = [[NSAttributedString alloc] initWithString:name attributes:@{
+        NSFontAttributeName: [UIFont systemFontOfSize:ISHWorkspaceThemeFontSize(UIFontTextStyleSubheadline) * 1.2 weight:UIFontWeightSemibold],
+        NSForegroundColorAttributeName: primary,
+        NSParagraphStyleAttributeName: style,
+    }];
+    [run setAttributedTitle:label forState:UIControlStateNormal];
+    [run addTarget:self action:@selector(runShortcutTapped:) forControlEvents:UIControlEventTouchUpInside];
+    return run;
+}
+
+- (UIButton *)launcherEditButton {
+    UIButton *edit = [UIButton buttonWithType:UIButtonTypeSystem];
+    edit.translatesAutoresizingMaskIntoConstraints = NO;
+    UIColor *accent = [self launcherColorForKey:@"accent" fallback:UIColor.systemBlueColor];
+    [edit setTitle:@"Edit Shortcuts" forState:UIControlStateNormal];
+    [edit setTitleColor:accent forState:UIControlStateNormal];
+    edit.titleLabel.font = [UIFont systemFontOfSize:ISHWorkspaceThemeFontSize(UIFontTextStyleSubheadline) weight:UIFontWeightSemibold];
+    edit.layer.cornerRadius = 12;
+    edit.layer.borderWidth = 1;
+    edit.layer.borderColor = accent.CGColor;
+    [edit.heightAnchor constraintEqualToConstant:ISHWorkspaceUsesPhoneLayout() ? 40.0 : 44.0].active = YES;
+    [edit addTarget:self action:@selector(editShortcutsTapped:) forControlEvents:UIControlEventTouchUpInside];
+    return edit;
+}
+
+- (void)runShortcutTapped:(UIButton *)sender {
+    NSArray<NSDictionary<NSString *, NSString *> *> *shortcuts = ISHWorkspaceLauncherShortcuts();
+    if ((NSUInteger)sender.tag >= shortcuts.count)
+        return;
+    NSDictionary<NSString *, NSString *> *shortcut = shortcuts[(NSUInteger)sender.tag];
+    [(id)self.workspaceHostViewController runLauncherShortcutWithCommand:shortcut[@"command"] title:shortcut[@"name"]];
+}
+
+- (void)editShortcutsTapped:(UIButton *)sender {
+    [(id)self.workspaceHostViewController presentLauncherEditorFromView:sender];
+}
+
+@end
+
 @implementation WorkspaceShortcutsToolViewController {
     UIScrollView *_scrollView;
     UIStackView *_contentStack;
@@ -6051,49 +7104,36 @@ NSString *ISHWorkspaceToolIdentifierForViewController(UIViewController *viewCont
     [_contentStack addArrangedSubview:header];
     [_contentStack addArrangedSubview:detail];
 
-    NSArray<NSArray<NSDictionary<NSString *, NSString *> *> *> *rows = nil;
+    // Desktops (row 1) are in-app and available on every device, incl. iPhone. "New Workspace"
+    // opens a real iOS scene window, so it's offered only on scene-capable devices (iPad
+    // multi-window); elsewhere the last row is just the Clock quick action.
+    NSMutableArray<NSArray<NSDictionary<NSString *, NSString *> *> *> *rows = [NSMutableArray arrayWithArray:@[
+        @[
+            @{@"title": @"Layout Manager", @"subtitle": @"Save or restore this workspace", @"identifier": @"dashboard"},
+            @{@"title": @"Desktops", @"subtitle": @"Manage in-app Desktops", @"identifier": ISHWorkspaceToolWorkspacesIdentifier},
+        ],
+        @[
+            @{@"title": @"Session Shell", @"subtitle": @"Open or focus the shell", @"identifier": @"shell"},
+            @{@"title": @"System Console", @"subtitle": @"Open or focus the console", @"identifier": @"console"},
+        ],
+        @[
+            @{@"title": @"Sessions", @"subtitle": @"Inspect live terminals", @"identifier": ISHWorkspaceToolSessionsIdentifier},
+            @{@"title": @"Storage", @"subtitle": @"Root and container usage", @"identifier": ISHWorkspaceToolStorageIdentifier},
+        ],
+        @[
+            @{@"title": @"Themes", @"subtitle": @"Colors, density, wallpaper", @"identifier": ISHWorkspaceToolThemesIdentifier},
+            @{@"title": @"Boot Images", @"subtitle": @"Manage installed roots", @"identifier": ISHWorkspaceToolFilesystemsIdentifier},
+        ],
+    ]];
     if (ISHWorkspaceSupportsSceneWindows()) {
-        rows = @[
-            @[
-                @{@"title": @"Layout Manager", @"subtitle": @"Save or restore this workspace", @"identifier": @"dashboard"},
-                @{@"title": @"Workspaces", @"subtitle": @"Tiny scene switcher", @"identifier": ISHWorkspaceToolWorkspacesIdentifier},
-            ],
-            @[
-                @{@"title": @"Session Shell", @"subtitle": @"Open or focus the shell", @"identifier": @"shell"},
-                @{@"title": @"System Console", @"subtitle": @"Open or focus the console", @"identifier": @"console"},
-            ],
-            @[
-                @{@"title": @"Sessions", @"subtitle": @"Inspect live terminals", @"identifier": ISHWorkspaceToolSessionsIdentifier},
-                @{@"title": @"Storage", @"subtitle": @"Root and container usage", @"identifier": ISHWorkspaceToolStorageIdentifier},
-            ],
-            @[
-                @{@"title": @"Themes", @"subtitle": @"Colors, density, wallpaper", @"identifier": ISHWorkspaceToolThemesIdentifier},
-                @{@"title": @"Boot Images", @"subtitle": @"Manage installed roots", @"identifier": ISHWorkspaceToolFilesystemsIdentifier},
-            ],
-            @[
-                @{@"title": @"New Workspace", @"subtitle": @"Open another workspace window", @"identifier": @"new-workspace"},
-                @{@"title": @"Clock", @"subtitle": @"Quick local time", @"identifier": ISHWorkspaceToolClockIdentifier},
-            ],
-        ];
+        [rows addObject:@[
+            @{@"title": @"New Workspace", @"subtitle": @"Open another workspace window", @"identifier": @"new-workspace"},
+            @{@"title": @"Clock", @"subtitle": @"Quick local time", @"identifier": ISHWorkspaceToolClockIdentifier},
+        ]];
     } else {
-        rows = @[
-            @[
-                @{@"title": @"Layout Manager", @"subtitle": @"Save or restore this workspace", @"identifier": @"dashboard"},
-                @{@"title": @"Themes", @"subtitle": @"Colors, density, wallpaper", @"identifier": ISHWorkspaceToolThemesIdentifier},
-            ],
-            @[
-                @{@"title": @"Session Shell", @"subtitle": @"Open or focus the shell", @"identifier": @"shell"},
-                @{@"title": @"System Console", @"subtitle": @"Open or focus the console", @"identifier": @"console"},
-            ],
-            @[
-                @{@"title": @"Sessions", @"subtitle": @"Inspect live terminals", @"identifier": ISHWorkspaceToolSessionsIdentifier},
-                @{@"title": @"Storage", @"subtitle": @"Root and container usage", @"identifier": ISHWorkspaceToolStorageIdentifier},
-            ],
-            @[
-                @{@"title": @"Boot Images", @"subtitle": @"Manage installed roots", @"identifier": ISHWorkspaceToolFilesystemsIdentifier},
-                @{@"title": @"Clock", @"subtitle": @"Quick local time", @"identifier": ISHWorkspaceToolClockIdentifier},
-            ],
-        ];
+        [rows addObject:@[
+            @{@"title": @"Clock", @"subtitle": @"Quick local time", @"identifier": ISHWorkspaceToolClockIdentifier},
+        ]];
     }
 
     for (NSArray<NSDictionary<NSString *, NSString *> *> *rowDescriptors in rows) {
@@ -6250,6 +7290,31 @@ static NSURL *ISHWorkspaceBrowserURLFromInput(NSString *input) {
     return button;
 }
 
+- (UIButton *)workspacesIconButtonWithSymbol:(NSString *)symbol fallback:(NSString *)fallback action:(SEL)action {
+    UIButton *button = [UIButton buttonWithType:UIButtonTypeSystem];
+    button.translatesAutoresizingMaskIntoConstraints = NO;
+    if (@available(iOS 13.0, *)) {
+        [button setImage:[UIImage systemImageNamed:symbol] forState:UIControlStateNormal];
+    } else {
+        [button setTitle:fallback forState:UIControlStateNormal];
+    }
+    button.accessibilityLabel = fallback;
+    button.layer.cornerRadius = 12;
+    [button addTarget:self action:action forControlEvents:UIControlEventTouchUpInside];
+    [button.heightAnchor constraintEqualToConstant:ISHWorkspaceUsesPhoneLayout() ? 36.0 : 40.0].active = YES;
+    return button;
+}
+
+- (void)saveLayoutFromApplet:(id)sender {
+    (void) sender;
+    [(id)self.workspaceHostViewController saveWorkspaceLayout:nil];
+}
+
+- (void)restoreLayoutFromApplet:(id)sender {
+    (void) sender;
+    [(id)self.workspaceHostViewController restoreWorkspaceLayout:nil];
+}
+
 - (UIImage *)scenePreviewImageForDescriptor:(NSDictionary<NSString *, id> *)descriptor size:(CGSize)size {
     NSDictionary<NSString *, UIColor *> *theme = self.workspaceTheme;
     UIColor *backgroundTop = [theme[@"backgroundTop"] colorWithAlphaComponent:0.94];
@@ -6358,6 +7423,8 @@ static NSURL *ISHWorkspaceBrowserURLFromInput(NSString *input) {
     return button;
 }
 
+// Renders the Desktop list: one row per Desktop (active one highlighted, tap to jump, remove
+// when there's more than one), then a "New Desktop" button. Refreshed on every Desktop change.
 - (void)rebuildSceneButtons {
     NSArray<UIView *> *existingRows = _rowsStack.arrangedSubviews.copy;
     for (UIView *view in existingRows) {
@@ -6367,40 +7434,82 @@ static NSURL *ISHWorkspaceBrowserURLFromInput(NSString *input) {
     [_trackedButtons removeAllObjects];
     [_previewImageViewsByIdentifier removeAllObjects];
 
-    if (_sceneDescriptors.count == 0) {
-        UILabel *emptyLabel = [self workspaceThemeSecondaryLabelWithTextStyle:UIFontTextStyleFootnote monospaced:NO];
-        emptyLabel.text = @"No other windows detected yet.";
-        [_rowsStack addArrangedSubview:emptyLabel];
-        return;
+    WorkspaceViewController *host = self.workspaceHostViewController;
+    NSInteger count = MAX((NSInteger)1, host.desktopCount);
+    NSInteger active = host.activeDesktopIndex;
+    for (NSInteger i = 0; i < count; i++) {
+        [_rowsStack addArrangedSubview:[self desktopRowForIndex:i active:(i == active) removable:(count > 1)]];
     }
+    [_rowsStack addArrangedSubview:[self workspacesActionButtonWithTitle:@"New Desktop" action:@selector(addDesktopFromApplet:)]];
 
-    BOOL twoColumns = _sceneDescriptors.count > 1;
-    if (twoColumns) {
-        for (NSUInteger index = 0; index < _sceneDescriptors.count; index += 2) {
-            UIStackView *row = [UIStackView new];
-            row.axis = UILayoutConstraintAxisHorizontal;
-            row.spacing = ISHWorkspaceDensityValue(4, 6);
-            row.distribution = UIStackViewDistributionFillEqually;
-            [row addArrangedSubview:[self workspaceSceneButtonWithDescriptor:_sceneDescriptors[index]]];
-            if (index + 1 < _sceneDescriptors.count) {
-                [row addArrangedSubview:[self workspaceSceneButtonWithDescriptor:_sceneDescriptors[index + 1]]];
-            } else {
-                UIView *spacer = [UIView new];
-                spacer.translatesAutoresizingMaskIntoConstraints = NO;
-                [row addArrangedSubview:spacer];
-            }
-            [_rowsStack addArrangedSubview:row];
-        }
-    } else {
-        for (NSDictionary<NSString *, id> *descriptor in _sceneDescriptors) {
-            [_rowsStack addArrangedSubview:[self workspaceSceneButtonWithDescriptor:descriptor]];
-        }
+    // Size the window to the Desktop count. Deferred so it runs after the host's initial
+    // placement, which would otherwise restore a stale frame.
+    __weak typeof(self) weakSelf = self;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [(id)weakSelf.workspaceHostViewController autosizeWorkspacesWindow];
+    });
+}
+
+- (UIView *)desktopRowForIndex:(NSInteger)index active:(BOOL)active removable:(BOOL)removable {
+    NSDictionary<NSString *, UIColor *> *theme = self.workspaceTheme;
+    UIColor *accent = theme[@"accent"] ?: UIColor.systemBlueColor;
+
+    UIStackView *row = [UIStackView new];
+    row.axis = UILayoutConstraintAxisHorizontal;
+    row.spacing = 6;
+    row.alignment = UIStackViewAlignmentFill;
+
+    UIButton *jump = [UIButton buttonWithType:UIButtonTypeSystem];
+    jump.translatesAutoresizingMaskIntoConstraints = NO;
+    jump.tag = index;
+    jump.contentHorizontalAlignment = UIControlContentHorizontalAlignmentLeft;
+    jump.contentEdgeInsets = UIEdgeInsetsMake(4, 12, 4, 12);
+    jump.titleLabel.font = [UIFont systemFontOfSize:ISHWorkspaceThemeFontSize(UIFontTextStyleSubheadline)
+                                             weight:active ? UIFontWeightSemibold : UIFontWeightRegular];
+    jump.layer.cornerRadius = 10;
+    jump.layer.borderWidth = 1;
+    jump.layer.borderColor = (theme[@"stroke"] ?: [UIColor colorWithWhite:0.5 alpha:0.35]).CGColor;
+    jump.backgroundColor = active ? [accent colorWithAlphaComponent:0.22] : nil;
+    [jump setTitle:[NSString stringWithFormat:@"Desktop %ld", (long)(index + 1)] forState:UIControlStateNormal];
+    [jump setTitleColor:active ? accent : (theme[@"primary"] ?: UIColor.darkTextColor) forState:UIControlStateNormal];
+    [jump.heightAnchor constraintEqualToConstant:ISHWorkspaceUsesPhoneLayout() ? 34.0 : 38.0].active = YES;
+    [jump addTarget:self action:@selector(jumpToDesktopFromApplet:) forControlEvents:UIControlEventTouchUpInside];
+    [row addArrangedSubview:jump];
+
+    if (removable) {
+        UIButton *remove = [UIButton buttonWithType:UIButtonTypeSystem];
+        remove.translatesAutoresizingMaskIntoConstraints = NO;
+        remove.tag = index;
+        if (@available(iOS 13.0, *))
+            [remove setImage:[UIImage systemImageNamed:@"xmark"] forState:UIControlStateNormal];
+        else
+            [remove setTitle:@"x" forState:UIControlStateNormal];
+        remove.tintColor = UIColor.systemRedColor;
+        remove.accessibilityLabel = [NSString stringWithFormat:@"Remove Desktop %ld", (long)(index + 1)];
+        [remove setContentHuggingPriority:UILayoutPriorityRequired forAxis:UILayoutConstraintAxisHorizontal];
+        [remove.widthAnchor constraintEqualToConstant:34.0].active = YES;
+        [remove addTarget:self action:@selector(removeDesktopFromApplet:) forControlEvents:UIControlEventTouchUpInside];
+        [row addArrangedSubview:remove];
     }
+    return row;
+}
+
+- (void)jumpToDesktopFromApplet:(UIButton *)sender {
+    [self.workspaceHostViewController switchToDesktopIndex:sender.tag];
+}
+
+- (void)addDesktopFromApplet:(id)sender {
+    (void) sender;
+    [self.workspaceHostViewController createNewDesktop];
+}
+
+- (void)removeDesktopFromApplet:(UIButton *)sender {
+    [self.workspaceHostViewController removeDesktopAtIndex:sender.tag];
 }
 
 - (void)viewDidLoad {
     [super viewDidLoad];
-    self.title = @"Workspaces";
+    self.title = @"Desktops";
     _trackedButtons = [NSMutableArray array];
     _previewImageViewsByIdentifier = [NSMutableDictionary dictionary];
 
@@ -6422,10 +7531,21 @@ static NSURL *ISHWorkspaceBrowserURLFromInput(NSString *input) {
     _rowsStack.spacing = 6;
     [listCard addSubview:_rowsStack];
 
-    _newWorkspaceButton = [self workspacesActionButtonWithTitle:@"New Workspace" action:@selector(openNewWorkspaceFromApplet:)];
-    [_contentStack addArrangedSubview:_newWorkspaceButton];
-    _closeHiddenButton = [self workspacesActionButtonWithTitle:@"Close Hidden Windows" action:@selector(confirmCloseHiddenWindows:)];
-    [_contentStack addArrangedSubview:_closeHiddenButton];
+    if (!ISHWorkspaceUsesModernStyle()) {
+        _newWorkspaceButton = [self workspacesActionButtonWithTitle:@"New Workspace" action:@selector(openNewWorkspaceFromApplet:)];
+        [_contentStack addArrangedSubview:_newWorkspaceButton];
+        _closeHiddenButton = [self workspacesActionButtonWithTitle:@"Close Hidden Windows" action:@selector(confirmCloseHiddenWindows:)];
+        [_contentStack addArrangedSubview:_closeHiddenButton];
+    } else {
+        // Modern folds the Layout Manager into this applet as two icons.
+        UIStackView *layoutRow = [UIStackView new];
+        layoutRow.axis = UILayoutConstraintAxisHorizontal;
+        layoutRow.distribution = UIStackViewDistributionFillEqually;
+        layoutRow.spacing = 6;
+        [layoutRow addArrangedSubview:[self workspacesIconButtonWithSymbol:@"square.and.arrow.down" fallback:@"Save" action:@selector(saveLayoutFromApplet:)]];
+        [layoutRow addArrangedSubview:[self workspacesIconButtonWithSymbol:@"arrow.clockwise" fallback:@"Restore" action:@selector(restoreLayoutFromApplet:)]];
+        [_contentStack addArrangedSubview:layoutRow];
+    }
     [NSLayoutConstraint activateConstraints:@[
         [_rowsStack.topAnchor constraintEqualToAnchor:listCard.topAnchor constant:8],
         [_rowsStack.leadingAnchor constraintEqualToAnchor:listCard.leadingAnchor constant:8],
@@ -6465,6 +7585,10 @@ static NSURL *ISHWorkspaceBrowserURLFromInput(NSString *input) {
                                                    name:UISceneDidDisconnectNotification
                                                  object:nil];
     }
+    [NSNotificationCenter.defaultCenter addObserver:self
+                                           selector:@selector(rebuildSceneButtons)
+                                               name:ISHWorkspaceDesktopsDidChangeNotification
+                                             object:nil];
 
     [self refreshWorkspaceScenes];
 }

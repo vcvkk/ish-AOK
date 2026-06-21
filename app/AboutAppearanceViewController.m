@@ -62,7 +62,7 @@ char *previewString = "# cat /proc/ish/colors\r\n"
 
 - (void)viewDidLoad {
     [super viewDidLoad];
-    [UserPreferences.shared observe:@[@"theme", @"fontSize", @"fontFamily", @"colorScheme"]
+    [UserPreferences.shared observe:@[@"theme", @"fontSize", @"fontFamily", @"colorScheme", @"workspaceStyle"]
                             options:0 owner:self usingBlock:^(typeof(self) self) {
         dispatch_async(dispatch_get_main_queue(), ^{
             [self.tableView reloadData];
@@ -106,10 +106,18 @@ enum {
     PreviewSection,
     MainSection,
     ColorSchemeSection,
+    WorkspaceStyleSection,
     CursorSection,
     StatusBarSection,
+    TerminalButtonsSection,
+    WorkspaceLaunchSection,
     NumberOfSections,
 };
+
+// In-app Desktops work on every device, so the launch count always applies.
+- (BOOL)supportsWorkspaceLaunchCount {
+    return YES;
+}
 
 - (NSInteger)numberOfSectionsInTableView:(UITableView *)tableView {
     return NumberOfSections;
@@ -120,8 +128,11 @@ enum {
         case PreviewSection: return 2;
         case MainSection: return 3;
         case ColorSchemeSection: return 3;
+        case WorkspaceStyleSection: return 2;
         case CursorSection: return 2;
         case StatusBarSection: return 1;
+        case TerminalButtonsSection: return 1;
+        case WorkspaceLaunchSection: return [self supportsWorkspaceLaunchCount] ? 4 : 0;
         default: NSAssert(NO, @"unhandled section"); return 0;
     }
 }
@@ -130,8 +141,11 @@ enum {
     switch (section) {
         case PreviewSection: return @"Preview";
         case ColorSchemeSection: return @"Color Scheme";
+        case WorkspaceStyleSection: return @"Workspace Style";
         case CursorSection: return @"Cursor";
         case StatusBarSection: return @"Status Bar";
+        case TerminalButtonsSection: return @"Terminal Buttons";
+        case WorkspaceLaunchSection: return [self supportsWorkspaceLaunchCount] ? @"Desktops at Launch" : nil;
         default: return nil;
     }
 }
@@ -139,6 +153,9 @@ enum {
 - (NSString *)tableView:(UITableView *)tableView titleForFooterInSection:(NSInteger)section {
     switch (section) {
         case PreviewSection: return @"Change the color scheme used for the preview.";
+        case WorkspaceStyleSection: return @"Modern is a flat, redesigned desktop; Classic keeps the original look. Both stay available and only restyle the Workspace.";
+        case TerminalButtonsSection: return @"Show the settings (gear) and terminal-switcher buttons on the terminal. Turn this off for a cleaner terminal.";
+        case WorkspaceLaunchSection: return [self supportsWorkspaceLaunchCount] ? @"How many in-app Desktops to open automatically at launch." : nil;
         default: return nil;
     }
 }
@@ -148,8 +165,11 @@ enum {
         case PreviewSection: return @[@"Preview", @"Color Scheme Preview"][indexPath.row];
         case MainSection: return @[@"Theme Name", @"Font", @"Font Size"][indexPath.row];
         case ColorSchemeSection: return @"Color Scheme";
+        case WorkspaceStyleSection: return @"Color Scheme";
         case CursorSection: return @[@"Cursor Style", @"Blink Cursor"][indexPath.row];
         case StatusBarSection: return @"Status Bar";
+        case TerminalButtonsSection: return @"Color Scheme";
+        case WorkspaceLaunchSection: return @"Color Scheme";
         default: return nil;
     }
 }
@@ -226,7 +246,49 @@ enum {
                 cell.accessibilityTraits &= ~UIAccessibilityTraitSelected;
             }
             break;
-            
+
+        case WorkspaceStyleSection:
+            switch (indexPath.row) {
+                case 0:
+                    cell.textLabel.text = @"Classic";
+                    break;
+                case 1:
+                    cell.textLabel.text = @"Modern";
+                    break;
+            }
+            if (indexPath.row == UserPreferences.shared.workspaceStyle) {
+                cell.accessoryType = UITableViewCellAccessoryCheckmark;
+                cell.accessibilityTraits |= UIAccessibilityTraitSelected;
+            } else {
+                cell.accessoryType = UITableViewCellAccessoryNone;
+                cell.accessibilityTraits &= ~UIAccessibilityTraitSelected;
+            }
+            break;
+
+        case TerminalButtonsSection:
+            cell.textLabel.text = @"Show Settings & Switcher";
+            if (UserPreferences.shared.showTerminalQuickButtons) {
+                cell.accessoryType = UITableViewCellAccessoryCheckmark;
+                cell.accessibilityTraits |= UIAccessibilityTraitSelected;
+            } else {
+                cell.accessoryType = UITableViewCellAccessoryNone;
+                cell.accessibilityTraits &= ~UIAccessibilityTraitSelected;
+            }
+            break;
+
+        case WorkspaceLaunchSection: {
+            NSInteger count = indexPath.row + 1;
+            cell.textLabel.text = count == 1 ? @"1 desktop" : [NSString stringWithFormat:@"%ld desktops", (long)count];
+            if (count == UserPreferences.shared.workspaceLaunchCount) {
+                cell.accessoryType = UITableViewCellAccessoryCheckmark;
+                cell.accessibilityTraits |= UIAccessibilityTraitSelected;
+            } else {
+                cell.accessoryType = UITableViewCellAccessoryNone;
+                cell.accessibilityTraits &= ~UIAccessibilityTraitSelected;
+            }
+            break;
+        }
+
         case CursorSection:
         case StatusBarSection:
             cell.selectionStyle = UITableViewCellSelectionStyleNone;
@@ -254,6 +316,18 @@ enum {
             break;
         case ColorSchemeSection:
             [UserPreferences.shared setColorScheme:indexPath.row];
+            break;
+        case WorkspaceStyleSection:
+            [UserPreferences.shared setWorkspaceStyle:indexPath.row];
+            break;
+        case TerminalButtonsSection:
+            UserPreferences.shared.showTerminalQuickButtons = !UserPreferences.shared.showTerminalQuickButtons;
+            [tableView reloadSections:[NSIndexSet indexSetWithIndex:TerminalButtonsSection] withRowAnimation:UITableViewRowAnimationNone];
+            break;
+        case WorkspaceLaunchSection:
+            UserPreferences.shared.workspaceLaunchCount = indexPath.row + 1;
+            [tableView reloadSections:[NSIndexSet indexSetWithIndex:WorkspaceLaunchSection] withRowAnimation:UITableViewRowAnimationNone];
+            break;
     }
 }
 

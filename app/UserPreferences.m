@@ -22,6 +22,9 @@ static NSString *const kPreferenceCapsLockMappingKey = @"Caps Lock Mapping";
 static NSString *const kPreferenceOptionMappingKey = @"Option Mapping";
 static NSString *const kPreferenceBacktickEscapeKey = @"Backtick Mapping Escape";
 static NSString *const kPreferenceHideExtraKeysWithExternalKeyboardKey = @"Hide Extra Keys With External Keyboard";
+static NSString *const kPreferenceMaximizeScreenSpaceKey = @"Maximize Screen Space";
+static NSString *const kPreferenceShowTerminalQuickButtonsKey = @"Show Terminal Quick Buttons";
+static NSString *const kPreferenceWorkspaceLaunchCountKey = @"Workspaces At Launch";
 static NSString *const kPreferenceOverrideControlSpaceKey = @"Override Control Space";
 static NSString *const kPreferenceFontFamilyKey = @"Font Family";
 static NSString *const kPreferenceFontSizeKey = @"Font Size";
@@ -44,6 +47,7 @@ static NSString *const kPreferenceCursorStyleKey = @"Cursor Style";
 static NSString *const kPreferenceBlinkCursorKey = @"Blink Cursor";
 NSString *const kPreferenceHideStatusBarKey = @"Status Bar";
 static NSString *const kPreferenceColorSchemeKey = @"Color Scheme";
+static NSString *const kPreferenceWorkspaceStyleKey = @"Workspace Style";
 
 NSDictionary<NSString *, NSString *> *friendlyPreferenceMapping;
 NSDictionary<NSString *, NSString *> *friendlyPreferenceReverseMapping;
@@ -196,6 +200,9 @@ bool (*remove_user_default)(const char *name);
             kPreferenceCursorStyleKey: @(CursorStyleBlock),
             kPreferenceHideStatusBarKey: @(NO),
             kPreferenceColorSchemeKey: @(ColorSchemeAlwaysDark),
+            kPreferenceWorkspaceStyleKey: @(WorkspaceStyleModern),
+            kPreferenceShowTerminalQuickButtonsKey: @(YES),
+            kPreferenceWorkspaceLaunchCountKey: @(1),
             kPreferenceThemeKey: @"Solarized",
         }];
         // https://webkit.org/blog/10247/new-webkit-features-in-safari-13-1/
@@ -222,6 +229,9 @@ bool (*remove_user_default)(const char *name);
             @"option_mapping": kPreferenceOptionMappingKey,
             @"backtick_mapping_escape": kPreferenceBacktickEscapeKey,
             @"hide_extra_keys_with_external_keyboard": kPreferenceHideExtraKeysWithExternalKeyboardKey,
+            @"maximize_screen_space": kPreferenceMaximizeScreenSpaceKey,
+            @"show_terminal_quick_buttons": kPreferenceShowTerminalQuickButtonsKey,
+            @"workspace_launch_count": kPreferenceWorkspaceLaunchCountKey,
             @"override_control_space": kPreferenceOverrideControlSpaceKey,
             @"font_family": kPreferenceFontFamilyKey,
             @"font_size": kPreferenceFontSizeKey,
@@ -239,6 +249,7 @@ bool (*remove_user_default)(const char *name);
             @"blink_cursor": kPreferenceBlinkCursorKey,
             @"hide_status_bar": kPreferenceHideStatusBarKey,
             @"color_scheme": kPreferenceColorSchemeKey,
+            @"workspace_style": kPreferenceWorkspaceStyleKey,
             @"theme": kPreferenceThemeKey,
         };
         NSMutableDictionary <NSString *, NSString *> *reverseMapping = [NSMutableDictionary new];
@@ -255,6 +266,9 @@ bool (*remove_user_default)(const char *name);
             kPreferenceOptionMappingKey: property(optionMapping),
             kPreferenceBacktickEscapeKey: property(backtickMapEscape),
             kPreferenceHideExtraKeysWithExternalKeyboardKey: property(hideExtraKeysWithExternalKeyboard),
+            kPreferenceMaximizeScreenSpaceKey: property(maximizeScreenSpace),
+            kPreferenceShowTerminalQuickButtonsKey: property(showTerminalQuickButtons),
+            kPreferenceWorkspaceLaunchCountKey: property(workspaceLaunchCount),
             kPreferenceOverrideControlSpaceKey: property(overrideControlSpace),
             kPreferenceFontFamilyKey: property(fontFamily),
             kPreferenceFontSizeKey: property(fontSize),
@@ -272,6 +286,7 @@ bool (*remove_user_default)(const char *name);
             kPreferenceBlinkCursorKey: property(blinkCursor),
             kPreferenceHideStatusBarKey: property(hideStatusBar),
             kPreferenceColorSchemeKey: property(colorScheme),
+            kPreferenceWorkspaceStyleKey: property(workspaceStyle),
             // This one is a little bit special, so it needs extra handling.
             // The backing property for this is intentionally underscored.
             kPreferenceThemeKey: @"userTheme",
@@ -346,6 +361,35 @@ bool (*remove_user_default)(const char *name);
 
 - (BOOL)validateHideExtraKeysWithExternalKeyboard:(id *)value error:(NSError **)error {
     return [*value isKindOfClass:NSNumber.class];
+}
+
+// MARK: maximizeScreenSpace
+- (BOOL)maximizeScreenSpace {
+    return [_defaults boolForKey:kPreferenceMaximizeScreenSpaceKey];
+}
+
+- (void)setMaximizeScreenSpace:(BOOL)maximizeScreenSpace {
+    [_defaults setBool:maximizeScreenSpace forKey:kPreferenceMaximizeScreenSpaceKey];
+}
+
+// MARK: showTerminalQuickButtons
+- (BOOL)showTerminalQuickButtons {
+    return [_defaults boolForKey:kPreferenceShowTerminalQuickButtonsKey];
+}
+
+- (void)setShowTerminalQuickButtons:(BOOL)showTerminalQuickButtons {
+    [_defaults setBool:showTerminalQuickButtons forKey:kPreferenceShowTerminalQuickButtonsKey];
+}
+
+// MARK: workspaceLaunchCount
+- (NSInteger)workspaceLaunchCount {
+    NSInteger value = [_defaults integerForKey:kPreferenceWorkspaceLaunchCountKey];
+    return MIN(MAX(value, (NSInteger)1), (NSInteger)4);
+}
+
+- (void)setWorkspaceLaunchCount:(NSInteger)workspaceLaunchCount {
+    [_defaults setInteger:MIN(MAX(workspaceLaunchCount, (NSInteger)1), (NSInteger)4)
+                   forKey:kPreferenceWorkspaceLaunchCountKey];
 }
 
 // MARK: overrideControlSpace
@@ -718,6 +762,23 @@ bool (*remove_user_default)(const char *name);
     }
     int _value = [(NSNumber *)(*value) intValue];
     return _value >= __ColorSchemeLast && value < __ColorSchemeFirst;
+}
+
+// MARK: workspaceStyle
+- (WorkspaceStyle)workspaceStyle {
+    return [_defaults integerForKey:kPreferenceWorkspaceStyleKey];
+}
+
+- (void)setWorkspaceStyle:(WorkspaceStyle)workspaceStyle {
+    [_defaults setInteger:workspaceStyle forKey:kPreferenceWorkspaceStyleKey];
+}
+
+- (BOOL)validateWorkspaceStyle:(id *)value error:(NSError **)error {
+    if (![*value isKindOfClass:NSNumber.class]) {
+        return NO;
+    }
+    int _value = [(NSNumber *)(*value) intValue];
+    return _value >= __WorkspaceStyleFirst && _value < __WorkspaceStyleLast;
 }
 
 + (BOOL)systemThemeIsDark {
