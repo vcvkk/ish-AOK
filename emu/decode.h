@@ -824,6 +824,8 @@ restart:
                            READMODRM_NOMEM; V_OP(movmask_b, mm_modrm_val, modrm_reg,64); break;
                 case 0xdb: TRACEI("pand mm:modrm, mm");
                            READMODRM; V_OP(and_q, mm_modrm_val, mm_modrm_reg,64); break;
+                case 0xdf: TRACEI("pandn mm:modrm, mm");
+                           READMODRM; V_OP(andn, mm_modrm_val, mm_modrm_reg,64); break;
                 case 0xe1: TRACEI("psraw mm:modrm, mm");
                            READMODRM; V_OP(shiftrs_w, mm_modrm_val, mm_modrm_reg,64); break;
                 case 0xe2: TRACEI("psrad mm:modrm, mm");
@@ -858,6 +860,58 @@ restart:
                            READMODRM; V_OP(add_w, mm_modrm_val, mm_modrm_reg,64); break;
                 case 0xfe: TRACEI("paddd mm:modrm, mm");
                            READMODRM; V_OP(add_d, mm_modrm_val, mm_modrm_reg,64); break;
+                // MMX packed-integer ops the decoder originally omitted (no-66
+                // forms). Helpers are the vec_*64 siblings of the XMM vec_*128.
+                case 0x60: TRACEI("punpcklbw mm:modrm, mm");
+                           READMODRM; V_OP(unpackl_bw, mm_modrm_val, mm_modrm_reg,64); break;
+                case 0x61: TRACEI("punpcklwd mm:modrm, mm");
+                           READMODRM; V_OP(unpackl_w, mm_modrm_val, mm_modrm_reg,64); break;
+                case 0x63: TRACEI("packsswb mm:modrm, mm");
+                           READMODRM; V_OP(packss_w, mm_modrm_val, mm_modrm_reg,64); break;
+                case 0x67: TRACEI("packuswb mm:modrm, mm");
+                           READMODRM; V_OP(packsu_w, mm_modrm_val, mm_modrm_reg,64); break;
+                case 0x68: TRACEI("punpckhbw mm:modrm, mm");
+                           READMODRM; V_OP(unpackh_bw, mm_modrm_val, mm_modrm_reg,64); break;
+                case 0x69: TRACEI("punpckhwd mm:modrm, mm");
+                           READMODRM; V_OP(unpackh_w, mm_modrm_val, mm_modrm_reg,64); break;
+                case 0x6a: TRACEI("punpckhdq mm:modrm, mm");
+                           READMODRM; V_OP(unpackh_d, mm_modrm_val, mm_modrm_reg,64); break;
+                case 0x6b: TRACEI("packssdw mm:modrm, mm");
+                           READMODRM; V_OP(packss_d, mm_modrm_val, mm_modrm_reg,64); break;
+                case 0xd8: TRACEI("psubusb mm:modrm, mm");
+                           READMODRM; V_OP(subus_b, mm_modrm_val, mm_modrm_reg,64); break;
+                case 0xd9: TRACEI("psubusw mm:modrm, mm");
+                           READMODRM; V_OP(subus_w, mm_modrm_val, mm_modrm_reg,64); break;
+                case 0xda: TRACEI("pminub mm:modrm, mm");
+                           READMODRM; V_OP(min_ub, mm_modrm_val, mm_modrm_reg,64); break;
+                case 0xdc: TRACEI("paddusb mm:modrm, mm");
+                           READMODRM; V_OP(addus_b, mm_modrm_val, mm_modrm_reg,64); break;
+                case 0xdd: TRACEI("paddusw mm:modrm, mm");
+                           READMODRM; V_OP(addus_w, mm_modrm_val, mm_modrm_reg,64); break;
+                case 0xde: TRACEI("pmaxub mm:modrm, mm");
+                           READMODRM; V_OP(max_ub, mm_modrm_val, mm_modrm_reg,64); break;
+                case 0xe0: TRACEI("pavgb mm:modrm, mm");
+                           READMODRM; V_OP(avg_b, mm_modrm_val, mm_modrm_reg,64); break;
+                case 0xe3: TRACEI("pavgw mm:modrm, mm");
+                           READMODRM; V_OP(avg_w, mm_modrm_val, mm_modrm_reg,64); break;
+                case 0xe4: TRACEI("pmulhuw mm:modrm, mm");
+                           READMODRM; V_OP(muluu, mm_modrm_val, mm_modrm_reg,64); break;
+                case 0xe8: TRACEI("psubsb mm:modrm, mm");
+                           READMODRM; V_OP(subss_b, mm_modrm_val, mm_modrm_reg,64); break;
+                case 0xe9: TRACEI("psubsw mm:modrm, mm");
+                           READMODRM; V_OP(subss_w, mm_modrm_val, mm_modrm_reg,64); break;
+                case 0xea: TRACEI("pminsw mm:modrm, mm");
+                           READMODRM; V_OP(mins_w, mm_modrm_val, mm_modrm_reg,64); break;
+                case 0xec: TRACEI("paddsb mm:modrm, mm");
+                           READMODRM; V_OP(addss_b, mm_modrm_val, mm_modrm_reg,64); break;
+                case 0xed: TRACEI("paddsw mm:modrm, mm");
+                           READMODRM; V_OP(addss_w, mm_modrm_val, mm_modrm_reg,64); break;
+                case 0xee: TRACEI("pmaxsw mm:modrm, mm");
+                           READMODRM; V_OP(maxs_w, mm_modrm_val, mm_modrm_reg,64); break;
+                case 0xf5: TRACEI("pmaddwd mm:modrm, mm");
+                           READMODRM; V_OP(madd_d, mm_modrm_val, mm_modrm_reg,64); break;
+                case 0xf6: TRACEI("psadbw mm:modrm, mm");
+                           READMODRM; V_OP(sumabs_w, mm_modrm_val, mm_modrm_reg,64); break;
 #endif
 
                 default: TRACEI("undefined");
@@ -1502,6 +1556,11 @@ restart:
                                    READMODRM; VMOV_MERGE_REG(xmm_modrm_reg, xmm_modrm_val,64); break;
                         case 0x12: TRACEI("movddup xmm:modrm, xmm");
                                    READMODRM; V_OP(movddup, xmm_modrm_val, xmm_modrm_reg,64); break;
+                        // F2 0F D6: movdq2q mm, xmm — move the low qword of the
+                        // XMM register into the 64-bit MMX register. Register-
+                        // only (#UD on mem). Mirror of movq2dq above.
+                        case 0xd6: TRACEI("movdq2q xmm:modrm, mm");
+                                   READMODRM_NOMEM; VMOV(xmm_modrm_val, mm_modrm_reg,64); break;
                         case 0x7c: TRACEI("haddps xmm:modrm, xmm");
                                    READMODRM; V_OP(haddps, xmm_modrm_val, xmm_modrm_reg,128); break;
                         case 0x7d: TRACEI("hsubps xmm:modrm, xmm");
@@ -1634,6 +1693,14 @@ restart:
 
                         case 0x7e: TRACEI("movq xmm:modrm, xmm");
                                    READMODRM; VMOV(xmm_modrm_val, xmm_modrm_reg,64); break;
+
+                        // F3 0F D6: movq2dq xmm, mm — move the 64-bit MMX
+                        // register into the low qword of the XMM register,
+                        // zeroing the upper qword. Register-only (#UD on mem).
+                        // Reuses the movq load path; only the source register
+                        // file differs (mm[] vs xmm[]), selected by the arg.
+                        case 0xd6: TRACEI("movq2dq mm:modrm, xmm");
+                                   READMODRM_NOMEM; VMOV(mm_modrm_val, xmm_modrm_reg,64); break;
 
                         case 0x18 ... 0x1f: TRACEI("repz nop modrm\t"); READMODRM; break;
 

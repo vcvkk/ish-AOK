@@ -34,6 +34,7 @@
 @property (nonatomic, strong) NSMutableArray<UIView *> *desktopWindows;
 @property (nonatomic) NSInteger activeDesktopIndex;
 @property (nonatomic) NSInteger desktopCount;
+@property (nonatomic, strong) NSMutableIndexSet *lockedDesktopIndices;
 @property (nonatomic, weak) UILabel *desktopIndicatorLabel;
 @property (nonatomic) NSInteger desktopWindowCascadeIndex;
 @property (nonatomic, weak) ISHWorkspaceContainedWindowView *dashboardWindow;
@@ -52,11 +53,16 @@
 - (void)switchToDesktopIndex:(NSInteger)index;
 - (void)createNewDesktop;
 - (void)removeDesktopAtIndex:(NSInteger)index;
+- (BOOL)isDesktopLockedAtIndex:(NSInteger)index;
+- (void)toggleDesktopLockAtIndex:(NSInteger)index;
 - (void)ensureDefaultWorkspaceUtilitiesOpen;
 - (void)ensureDefaultLLMChatWindowOpenIfNeeded;
 - (void)persistDefaultWorkspaceUtilityFrames;
 - (NSString *)persistentWorkspacesWindowFrameDefaultsKey;
 - (void)applyInitialPlacementToWorkspacesWindow:(ISHWorkspaceContainedWindowView *)windowView;
+- (void)applyInitialPlacementToLauncherWindow:(ISHWorkspaceContainedWindowView *)windowView;
+- (void)persistLauncherWindowFrame;
+- (void)restoreLauncherWindowPlacement;
 - (void)persistDockWindowFrame;
 - (NSString *)persistentDockWindowDescriptorDefaultsKey;
 - (void)applyInitialPlacementToDockWindow:(ISHWorkspaceContainedWindowView *)windowView;
@@ -106,6 +112,7 @@ static NSString *const ISHWorkspaceSavedLayoutDefaultsKey = @"ISHWorkspaceSavedL
 static NSString *const ISHWorkspacePersistentWorkspacesWindowFrameDefaultsKey = @"ISHWorkspacePersistentWorkspacesWindowFrame";
 static NSString *const ISHWorkspaceLegacyPersistentWorkspacesWindowFrameDefaultsKeyPrefix = @"ISHWorkspacePersistentWorkspacesWindowFrame";
 static NSString *const ISHWorkspacePersistentDockWindowDescriptorDefaultsKey = @"ISHWorkspacePersistentDockWindowDescriptor";
+static NSString *const ISHWorkspacePersistentLauncherWindowFrameDefaultsKey = @"ISHWorkspacePersistentLauncherWindowFrame";
 static NSString *const ISHWorkspaceForgottenHiddenSessionsDefaultsKey = @"ISHWorkspaceForgottenHiddenSessions";
 static NSString *const ISHWorkspaceDockFrameDidChangeNotification = @"ISHWorkspaceDockFrameDidChange";
 static NSString *const ISHWorkspaceWorkspacesFrameDidChangeNotification = @"ISHWorkspaceWorkspacesFrameDidChange";
@@ -672,17 +679,19 @@ static CGSize ISHWorkspaceLauncherContentSize(void) {
 static CGSize ISHWorkspaceWorkspacesContentSize(NSUInteger count) {
     BOOL phone = ISHWorkspaceUsesPhoneLayout();
     NSUInteger n = MAX(count, (NSUInteger)1);
-    CGFloat rowHeight = phone ? 34.0 : 38.0;
-    CGFloat newDesktopHeight = phone ? 36.0 : 40.0;
-    CGFloat spacing = 6.0;
-    CGFloat cardPadding = 16.0;
-    CGFloat actionsHeight = phone ? 40.0 : 44.0;
-    CGFloat chrome = phone ? 28.0 : 32.0;
-    CGFloat width = phone ? 200.0 : 220.0;
+    CGFloat rowHeight = phone ? 30.0 : 38.0;
+    CGFloat newDesktopHeight = phone ? 30.0 : 40.0;
+    CGFloat spacing = phone ? 5.0 : 6.0;
+    CGFloat cardPadding = phone ? 12.0 : 16.0;
+    CGFloat actionsHeight = phone ? 36.0 : 44.0;
+    CGFloat chrome = phone ? 24.0 : 32.0;
+    CGFloat width = phone ? 214.0 : 254.0;
     CGFloat rowsHeight = n * rowHeight + n * spacing + newDesktopHeight;
     CGFloat height = rowsHeight + cardPadding + actionsHeight + chrome;
     return CGSizeMake(width, height);
 }
+
+static CGSize ISHWorkspaceMonitorContentSize(void);
 
 static CGSize ISHWorkspacePreferredToolContentSize(NSString *toolIdentifier) {
     if (ISHWorkspaceUsesPhoneLayout()) {
@@ -691,7 +700,7 @@ static CGSize ISHWorkspacePreferredToolContentSize(NSString *toolIdentifier) {
         if ([toolIdentifier isEqualToString:ISHWorkspaceToolInfoIdentifier])
             return CGSizeMake(280, 154);
         if ([toolIdentifier isEqualToString:ISHWorkspaceToolMonitorIdentifier])
-            return CGSizeMake(328, 170);
+            return ISHWorkspaceMonitorContentSize();
         if ([toolIdentifier isEqualToString:ISHWorkspaceToolNetworksIdentifier])
             return CGSizeMake(328, 176);
         if ([toolIdentifier isEqualToString:ISHWorkspaceToolStatusIdentifier])
@@ -725,7 +734,7 @@ static CGSize ISHWorkspacePreferredToolContentSize(NSString *toolIdentifier) {
     if ([toolIdentifier isEqualToString:ISHWorkspaceToolInfoIdentifier])
         return CGSizeMake(318, 168);
     if ([toolIdentifier isEqualToString:ISHWorkspaceToolMonitorIdentifier])
-        return CGSizeMake(360, 182);
+        return ISHWorkspaceMonitorContentSize();
     if ([toolIdentifier isEqualToString:ISHWorkspaceToolNetworksIdentifier])
         return CGSizeMake(360, 188);
     if ([toolIdentifier isEqualToString:ISHWorkspaceToolStatusIdentifier])
@@ -1864,6 +1873,24 @@ static void ISHWorkspaceSetUsesRingGauges(BOOL usesRings) {
     [NSNotificationCenter.defaultCenter postNotificationName:ISHWorkspaceGaugeStyleDidChangeNotification object:nil];
 }
 
+// The Monitor applet stacks two gauge rows (CPU/Memory, Battery/Storage) over a details card. Ring
+// gauges are much taller than bars, so size the window to the ACTIVE gauge style — a window sized
+// for bars clips the bottom row of dials when rings are selected (the reported bug), and one sized
+// for rings would leave dead space under bars. Returns the window frame height (incl. title bar).
+static CGSize ISHWorkspaceMonitorContentSize(void) {
+    BOOL phone = ISHWorkspaceUsesPhoneLayout();
+    BOOL rings = ISHWorkspaceUsesRingGauges();
+    CGFloat width = phone ? 328.0 : 360.0;
+    CGFloat gaugeHeight = rings ? (phone ? 42.0 : 54.0) : (phone ? 20.0 : 28.0);
+    CGFloat tileInset = phone ? 5.0 : 7.0;
+    // tile = vertical inset×2 + header row + stack spacing + gauge; floored at the card min height.
+    CGFloat tileHeight = MAX(phone ? 50.0 : 64.0, tileInset * 2.0 + 20.0 + 5.0 + gaugeHeight);
+    CGFloat detailsCardHeight = phone ? 112.0 : 124.0;
+    // contentStack: 6pt top/bottom inset, 8pt between its three children (2 gauge rows + card).
+    CGFloat contentHeight = 6.0 * 2.0 + tileHeight * 2.0 + 8.0 * 2.0 + detailsCardHeight;
+    return CGSizeMake(width, contentHeight + ISHWorkspaceWindowTitleBarHeight);
+}
+
 static CGFloat ISHWorkspaceDensityValue(CGFloat compact, CGFloat roomy) {
     return compact + ((roomy - compact) * ISHWorkspaceCurrentDensity());
 }
@@ -2950,6 +2977,13 @@ NSString *ISHWorkspaceToolIdentifierForViewController(UIViewController *viewCont
     CGSize preferredSize = ISHWorkspacePreferredToolContentSize(toolIdentifier);
     viewController.preferredContentSize = preferredSize;
     BOOL workspacesTool = [toolIdentifier isEqualToString:ISHWorkspaceToolWorkspacesIdentifier];
+    // On iPad the Desktops applet is a pinned utility with its own persisted top-right placement.
+    // On a phone that placement misbehaves (and the persist key is shared across idioms), so there
+    // the Desktops applet opens like any other tool — normal cascade placement, same as Launcher.
+    BOOL pinnedWorkspaces = workspacesTool && !ISHWorkspaceUsesPhoneLayout();
+    // The Launcher (a global tool) persists its own frame like the dock, so it returns to exactly
+    // where the user left it after a foreground transition instead of drifting to its open spot.
+    BOOL launcherTool = [toolIdentifier isEqualToString:ISHWorkspaceToolLauncherIdentifier];
     // Settings embeds its own navigation bar and gets a "Done" item there instead (see below),
     // so suppress the redundant chrome × that would otherwise sit right above that bar.
     BOOL settingsTool = [toolIdentifier isEqualToString:ISHWorkspaceToolSettingsIdentifier];
@@ -2957,7 +2991,7 @@ NSString *ISHWorkspaceToolIdentifierForViewController(UIViewController *viewCont
         [self createDesktopWindowWithTitle:ISHWorkspaceToolTitle(toolIdentifier)
                              preferredSize:preferredSize
                           showsCloseButton:!settingsTool
-                    appliesInitialPlacement:!workspacesTool];
+                    appliesInitialPlacement:!pinnedWorkspaces];
     windowView.workspaceToolIdentifier = toolIdentifier;
     if ([self isGlobalToolIdentifier:toolIdentifier])
         windowView.workspaceDesktopIndex = 0;  // global singletons live on the first Desktop
@@ -2966,10 +3000,16 @@ NSString *ISHWorkspaceToolIdentifierForViewController(UIViewController *viewCont
         windowView.resizable = YES;
         windowView.minimumSize = minimumSize;
     }
-    if (workspacesTool) {
+    if (pinnedWorkspaces) {
         __weak typeof(self) weakSelf = self;
         windowView.frameDidChangeHandler = ^{
             [weakSelf persistDefaultWorkspaceUtilityFrames];
+        };
+    }
+    if (launcherTool) {
+        __weak typeof(self) weakSelf = self;
+        windowView.frameDidChangeHandler = ^{
+            [weakSelf persistLauncherWindowFrame];
         };
     }
     [self attachViewController:viewController toDesktopWindow:windowView];
@@ -2984,10 +3024,12 @@ NSString *ISHWorkspaceToolIdentifierForViewController(UIViewController *viewCont
                                                           target:self
                                                           action:@selector(dismissSettingsToolWindow:)];
     }
-    if (workspacesTool) {
+    if (pinnedWorkspaces)
         [self applyInitialPlacementToWorkspacesWindow:windowView];
+    if (launcherTool)
+        [self applyInitialPlacementToLauncherWindow:windowView];
+    if (workspacesTool)
         [self.desktopSurfaceView bringSubviewToFront:windowView];
-    }
     [self refreshDockButtons];
     return windowView;
 }
@@ -3615,6 +3657,13 @@ NSString *ISHWorkspaceToolIdentifierForViewController(UIViewController *viewCont
     [self resizeDesktopWindow:window toSize:ISHWorkspaceLauncherContentSize() animated:YES];
 }
 
+- (void)autosizeMonitorWindow {
+    ISHWorkspaceContainedWindowView *window = [self desktopWindowForToolIdentifier:ISHWorkspaceToolMonitorIdentifier];
+    if (window == nil)
+        return;
+    [self resizeDesktopWindow:window toSize:ISHWorkspaceMonitorContentSize() animated:YES];
+}
+
 // In-app Desktops: a Desktop is a set of contained windows sharing a workspaceDesktopIndex.
 // Only the active Desktop's windows are visible; switching just shows/hides by index (the dock
 // and Layout Manager are global chrome and stay put). Terminals keep running while hidden.
@@ -3704,6 +3753,9 @@ NSString *ISHWorkspaceToolIdentifierForViewController(UIViewController *viewCont
     if (self.desktopCount <= 1)
         return;
     indexToRemove = MAX((NSInteger)0, MIN(indexToRemove, self.desktopCount - 1));
+    // A locked Desktop can't be removed.
+    if ([self isDesktopLockedAtIndex:indexToRemove])
+        return;
     // Close the removed Desktop's windows; shift higher Desktops down. Global tools stay put.
     for (UIView *view in self.desktopWindows.copy) {
         if (![view isKindOfClass:ISHWorkspaceContainedWindowView.class])
@@ -3720,12 +3772,46 @@ NSString *ISHWorkspaceToolIdentifierForViewController(UIViewController *viewCont
             windowView.workspaceDesktopIndex -= 1;
         }
     }
+    // Renumber locked Desktops to match the shift (the removed index is never locked).
+    if (_lockedDesktopIndices.count > 0) {
+        NSMutableIndexSet *shifted = [NSMutableIndexSet indexSet];
+        [_lockedDesktopIndices enumerateIndexesUsingBlock:^(NSUInteger i, BOOL *stop) {
+            (void) stop;
+            if ((NSInteger)i > indexToRemove)
+                [shifted addIndex:i - 1];
+            else if ((NSInteger)i < indexToRemove)
+                [shifted addIndex:i];
+        }];
+        _lockedDesktopIndices = shifted;
+    }
     self.desktopCount -= 1;
     if (self.activeDesktopIndex >= self.desktopCount)
         self.activeDesktopIndex = self.desktopCount - 1;
     else if (self.activeDesktopIndex > indexToRemove)
         self.activeDesktopIndex -= 1;
     [self applyDesktopVisibility];
+    [self postDesktopsDidChange];
+}
+
+- (NSMutableIndexSet *)lockedDesktopIndices {
+    if (_lockedDesktopIndices == nil)
+        _lockedDesktopIndices = [NSMutableIndexSet indexSet];
+    return _lockedDesktopIndices;
+}
+
+- (BOOL)isDesktopLockedAtIndex:(NSInteger)index {
+    if (index == 0)
+        return YES;  // the first Desktop is permanently protected and can't be removed
+    return index >= 0 && [self.lockedDesktopIndices containsIndex:(NSUInteger)index];
+}
+
+- (void)toggleDesktopLockAtIndex:(NSInteger)index {
+    if (index <= 0 || index >= self.desktopCount)
+        return;  // the first Desktop is always locked; only Desktops 2+ can be toggled
+    if ([self.lockedDesktopIndices containsIndex:(NSUInteger)index])
+        [self.lockedDesktopIndices removeIndex:(NSUInteger)index];
+    else
+        [self.lockedDesktopIndices addIndex:(NSUInteger)index];
     [self postDesktopsDidChange];
 }
 
@@ -4174,10 +4260,13 @@ NSString *ISHWorkspaceToolIdentifierForViewController(UIViewController *viewCont
     if (self.dockWindow != nil) {
         [self applyInitialPlacementToDockWindow:self.dockWindow];
     }
-    ISHWorkspaceContainedWindowView *workspacesWindow =
-        [self desktopWindowForToolIdentifier:ISHWorkspaceToolWorkspacesIdentifier];
-    if (workspacesWindow != nil) {
-        [self applyInitialPlacementToWorkspacesWindow:workspacesWindow];
+    // Pinned placement is iPad-only; on phone the Desktops applet keeps its normal placement.
+    if (!ISHWorkspaceUsesPhoneLayout()) {
+        ISHWorkspaceContainedWindowView *workspacesWindow =
+            [self desktopWindowForToolIdentifier:ISHWorkspaceToolWorkspacesIdentifier];
+        if (workspacesWindow != nil) {
+            [self applyInitialPlacementToWorkspacesWindow:workspacesWindow];
+        }
     }
     [self presentStartupLowMemoryWarningIfNeeded];
 }
@@ -4344,10 +4433,16 @@ NSString *ISHWorkspaceToolIdentifierForViewController(UIViewController *viewCont
     if (self.dockWindow != nil) {
         [self applyInitialPlacementToDockWindow:self.dockWindow];
     }
-    ISHWorkspaceContainedWindowView *workspacesWindow =
-        [self desktopWindowForToolIdentifier:ISHWorkspaceToolWorkspacesIdentifier];
-    if (workspacesWindow != nil) {
-        [self applyInitialPlacementToWorkspacesWindow:workspacesWindow];
+    [self restoreLauncherWindowPlacement];
+    // The Desktops applet is a pinned utility only on iPad. On phone it uses normal cascade
+    // placement, so re-pinning it here would yank it off-screen on every scene activation
+    // (which is why it "vanished" after interacting). Leave the phone applet where it is.
+    if (!ISHWorkspaceUsesPhoneLayout()) {
+        ISHWorkspaceContainedWindowView *workspacesWindow =
+            [self desktopWindowForToolIdentifier:ISHWorkspaceToolWorkspacesIdentifier];
+        if (workspacesWindow != nil) {
+            [self applyInitialPlacementToWorkspacesWindow:workspacesWindow];
+        }
     }
 }
 
@@ -4362,6 +4457,10 @@ NSString *ISHWorkspaceToolIdentifierForViewController(UIViewController *viewCont
 - (void)workspaceWorkspacesFrameDidChange:(NSNotification *)notification {
     if (notification.object == self)
         return;
+    // iPad-only pinned-utility frame sync across scenes; on phone the applet isn't pinned, so
+    // re-placing it here would push it off-screen.
+    if (ISHWorkspaceUsesPhoneLayout())
+        return;
     ISHWorkspaceContainedWindowView *workspacesWindow =
         [self desktopWindowForToolIdentifier:ISHWorkspaceToolWorkspacesIdentifier];
     if (workspacesWindow != nil) {
@@ -4370,6 +4469,11 @@ NSString *ISHWorkspaceToolIdentifierForViewController(UIViewController *viewCont
 }
 
 - (NSString *)currentWorkspaceLayoutStorageIdentifier {
+    // In-app Desktops are a single workspace (no per-scene layouts). On a phone the scene can be
+    // discarded and reconnected on foreground with a fresh persistentIdentifier, which would
+    // orphan a scene-keyed saved layout — so use a stable key there and Save/Restore survives.
+    if (ISHWorkspaceUsesPhoneLayout())
+        return @"default";
     if (@available(iOS 13.0, *)) {
         NSString *identifier = self.view.window.windowScene.session.persistentIdentifier;
         if (identifier.length > 0)
@@ -4502,8 +4606,10 @@ NSString *ISHWorkspaceToolIdentifierForViewController(UIViewController *viewCont
 }
 
 - (void)ensureDefaultWorkspaceUtilitiesOpen {
-    if (!ISHWorkspaceSupportsSceneWindows())
-        return;
+    // In-app Desktops are no longer scene-window-only, so the Desktops applet auto-opens on every
+    // device now, including iPhone. This was previously gated off here by the iPad-only scene
+    // check (ISHWorkspaceSupportsSceneWindows), which is exactly why the applet never appeared on
+    // iPhone.
     if ([self desktopWindowForToolIdentifier:ISHWorkspaceToolWorkspacesIdentifier] != nil)
         return;
     [self openWorkspaceToolWithIdentifier:ISHWorkspaceToolWorkspacesIdentifier];
@@ -4542,6 +4648,31 @@ NSString *ISHWorkspaceToolIdentifierForViewController(UIViewController *viewCont
 
 - (NSString *)persistentWorkspacesWindowFrameDefaultsKey {
     return ISHWorkspacePersistentWorkspacesWindowFrameDefaultsKey;
+}
+
+- (void)persistLauncherWindowFrame {
+    ISHWorkspaceContainedWindowView *launcherWindow = [self desktopWindowForToolIdentifier:ISHWorkspaceToolLauncherIdentifier];
+    if (launcherWindow == nil || launcherWindow.hidden)
+        return;
+    NSDictionary<NSString *, NSNumber *> *frameDescriptor = [self absoluteFrameDescriptorForFrame:launcherWindow.frame];
+    if (frameDescriptor != nil)
+        [NSUserDefaults.standardUserDefaults setObject:frameDescriptor
+                                                forKey:ISHWorkspacePersistentLauncherWindowFrameDefaultsKey];
+}
+
+- (void)applyInitialPlacementToLauncherWindow:(ISHWorkspaceContainedWindowView *)windowView {
+    if (windowView == nil)
+        return;
+    NSDictionary<NSString *, id> *frameDescriptor =
+        [NSUserDefaults.standardUserDefaults dictionaryForKey:ISHWorkspacePersistentLauncherWindowFrameDefaultsKey];
+    if ([frameDescriptor isKindOfClass:NSDictionary.class])
+        [self applyAbsoluteFrameDescriptor:frameDescriptor toWindow:windowView];
+}
+
+- (void)restoreLauncherWindowPlacement {
+    ISHWorkspaceContainedWindowView *launcherWindow = [self desktopWindowForToolIdentifier:ISHWorkspaceToolLauncherIdentifier];
+    if (launcherWindow != nil)
+        [self applyInitialPlacementToLauncherWindow:launcherWindow];
 }
 
 - (void)persistDockWindowFrame {
@@ -6935,6 +7066,19 @@ NSString *ISHWorkspaceToolIdentifierForViewController(UIViewController *viewCont
                                            selector:@selector(launcherShortcutsDidChange)
                                                name:ISHWorkspaceLauncherShortcutsDidChangeNotification
                                              object:nil];
+    // Re-assert the Launcher's placement when the app returns to the foreground. The Launcher is
+    // otherwise the one window the activation transition can leave displaced; the Desktops applet
+    // already self-corrects the same way via its own foreground observers.
+    [NSNotificationCenter.defaultCenter addObserver:self
+                                           selector:@selector(reassertLauncherPlacement)
+                                               name:UIApplicationDidBecomeActiveNotification
+                                             object:nil];
+    if (@available(iOS 13.0, *)) {
+        [NSNotificationCenter.defaultCenter addObserver:self
+                                               selector:@selector(reassertLauncherPlacement)
+                                                   name:UISceneDidActivateNotification
+                                                 object:nil];
+    }
 }
 
 - (void)dealloc {
@@ -6945,6 +7089,15 @@ NSString *ISHWorkspaceToolIdentifierForViewController(UIViewController *viewCont
     [self rebuildLauncherList];
     // Grow/shrink the window to match the new item count.
     [(id)self.workspaceHostViewController autosizeLauncherWindow];
+}
+
+- (void)reassertLauncherPlacement {
+    // Deferred so it runs after the foreground layout pass settles, then restores the Launcher to
+    // its persisted frame (like the dock) so it returns to exactly where the user left it.
+    __weak typeof(self) weakSelf = self;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [(id)weakSelf.workspaceHostViewController restoreLauncherWindowPlacement];
+    });
 }
 
 - (UIColor *)launcherColorForKey:(NSString *)key fallback:(UIColor *)fallback {
@@ -7281,12 +7434,14 @@ static NSURL *ISHWorkspaceBrowserURLFromInput(NSString *input) {
     UIButton *button = [UIButton buttonWithType:UIButtonTypeSystem];
     button.translatesAutoresizingMaskIntoConstraints = NO;
     button.contentHorizontalAlignment = UIControlContentHorizontalAlignmentCenter;
-    button.titleLabel.font = [UIFont preferredFontForTextStyle:UIFontTextStyleHeadline];
-    button.layer.cornerRadius = 12;
+    button.titleLabel.font = [UIFont systemFontOfSize:(ISHWorkspaceUsesPhoneLayout() ? 14.0 : 16.0) weight:UIFontWeightSemibold];
+    button.titleLabel.adjustsFontSizeToFitWidth = YES;
+    button.titleLabel.minimumScaleFactor = 0.7;
+    button.layer.cornerRadius = ISHWorkspaceUsesPhoneLayout() ? 9.0 : 12.0;
     button.layer.borderWidth = 1;
     [button setTitle:title forState:UIControlStateNormal];
     [button addTarget:self action:action forControlEvents:UIControlEventTouchUpInside];
-    [button.heightAnchor constraintEqualToConstant:ISHWorkspaceUsesPhoneLayout() ? 36.0 : 40.0].active = YES;
+    [button.heightAnchor constraintEqualToConstant:ISHWorkspaceUsesPhoneLayout() ? 30.0 : 40.0].active = YES;
     return button;
 }
 
@@ -7453,11 +7608,37 @@ static NSURL *ISHWorkspaceBrowserURLFromInput(NSString *input) {
 - (UIView *)desktopRowForIndex:(NSInteger)index active:(BOOL)active removable:(BOOL)removable {
     NSDictionary<NSString *, UIColor *> *theme = self.workspaceTheme;
     UIColor *accent = theme[@"accent"] ?: UIColor.systemBlueColor;
+    UIColor *muted = [(theme[@"primary"] ?: UIColor.grayColor) colorWithAlphaComponent:0.5];
+    BOOL locked = [self.workspaceHostViewController isDesktopLockedAtIndex:index];
 
     UIStackView *row = [UIStackView new];
     row.axis = UILayoutConstraintAxisHorizontal;
     row.spacing = 6;
     row.alignment = UIStackViewAlignmentFill;
+
+    // Lock / unlock toggle, left of the card. A locked Desktop can't be removed.
+    UIButton *lock = [UIButton buttonWithType:UIButtonTypeSystem];
+    lock.translatesAutoresizingMaskIntoConstraints = NO;
+    lock.tag = index;
+    if (@available(iOS 13.0, *)) {
+        UIImageSymbolConfiguration *config =
+            [UIImageSymbolConfiguration configurationWithPointSize:13.0 weight:UIImageSymbolWeightSemibold];
+        [lock setImage:[UIImage systemImageNamed:(locked ? @"lock.fill" : @"lock.open")
+                               withConfiguration:config]
+              forState:UIControlStateNormal];
+    } else {
+        [lock setTitle:(locked ? @"🔒" : @"🔓") forState:UIControlStateNormal];
+    }
+    lock.tintColor = locked ? accent : muted;
+    // The first Desktop is permanently protected, so its lock shows closed and isn't toggleable.
+    lock.enabled = (index != 0);
+    lock.accessibilityLabel = (index == 0)
+        ? @"Desktop 1 is protected"
+        : [NSString stringWithFormat:@"%@ Desktop %ld", locked ? @"Unlock" : @"Lock", (long)(index + 1)];
+    [lock setContentHuggingPriority:UILayoutPriorityRequired forAxis:UILayoutConstraintAxisHorizontal];
+    [lock.widthAnchor constraintEqualToConstant:28.0].active = YES;
+    [lock addTarget:self action:@selector(toggleLockFromApplet:) forControlEvents:UIControlEventTouchUpInside];
+    [row addArrangedSubview:lock];
 
     UIButton *jump = [UIButton buttonWithType:UIButtonTypeSystem];
     jump.translatesAutoresizingMaskIntoConstraints = NO;
@@ -7472,22 +7653,27 @@ static NSURL *ISHWorkspaceBrowserURLFromInput(NSString *input) {
     jump.backgroundColor = active ? [accent colorWithAlphaComponent:0.22] : nil;
     [jump setTitle:[NSString stringWithFormat:@"Desktop %ld", (long)(index + 1)] forState:UIControlStateNormal];
     [jump setTitleColor:active ? accent : (theme[@"primary"] ?: UIColor.darkTextColor) forState:UIControlStateNormal];
-    [jump.heightAnchor constraintEqualToConstant:ISHWorkspaceUsesPhoneLayout() ? 34.0 : 38.0].active = YES;
+    [jump.heightAnchor constraintEqualToConstant:ISHWorkspaceUsesPhoneLayout() ? 30.0 : 38.0].active = YES;
     [jump addTarget:self action:@selector(jumpToDesktopFromApplet:) forControlEvents:UIControlEventTouchUpInside];
     [row addArrangedSubview:jump];
 
-    if (removable) {
+    // The delete x is hidden entirely while the Desktop is locked; unlock to remove it.
+    if (removable && !locked) {
         UIButton *remove = [UIButton buttonWithType:UIButtonTypeSystem];
         remove.translatesAutoresizingMaskIntoConstraints = NO;
         remove.tag = index;
-        if (@available(iOS 13.0, *))
-            [remove setImage:[UIImage systemImageNamed:@"xmark"] forState:UIControlStateNormal];
-        else
+        if (@available(iOS 13.0, *)) {
+            UIImageSymbolConfiguration *config =
+                [UIImageSymbolConfiguration configurationWithPointSize:11.0 weight:UIImageSymbolWeightSemibold];
+            [remove setImage:[UIImage systemImageNamed:@"xmark" withConfiguration:config]
+                    forState:UIControlStateNormal];
+        } else {
             [remove setTitle:@"x" forState:UIControlStateNormal];
+        }
         remove.tintColor = UIColor.systemRedColor;
         remove.accessibilityLabel = [NSString stringWithFormat:@"Remove Desktop %ld", (long)(index + 1)];
         [remove setContentHuggingPriority:UILayoutPriorityRequired forAxis:UILayoutConstraintAxisHorizontal];
-        [remove.widthAnchor constraintEqualToConstant:34.0].active = YES;
+        [remove.widthAnchor constraintEqualToConstant:28.0].active = YES;
         [remove addTarget:self action:@selector(removeDesktopFromApplet:) forControlEvents:UIControlEventTouchUpInside];
         [row addArrangedSubview:remove];
     }
@@ -7505,6 +7691,10 @@ static NSURL *ISHWorkspaceBrowserURLFromInput(NSString *input) {
 
 - (void)removeDesktopFromApplet:(UIButton *)sender {
     [self.workspaceHostViewController removeDesktopAtIndex:sender.tag];
+}
+
+- (void)toggleLockFromApplet:(UIButton *)sender {
+    [self.workspaceHostViewController toggleDesktopLockAtIndex:sender.tag];
 }
 
 - (void)viewDidLoad {
@@ -7546,11 +7736,12 @@ static NSURL *ISHWorkspaceBrowserURLFromInput(NSString *input) {
         [layoutRow addArrangedSubview:[self workspacesIconButtonWithSymbol:@"arrow.clockwise" fallback:@"Restore" action:@selector(restoreLayoutFromApplet:)]];
         [_contentStack addArrangedSubview:layoutRow];
     }
+    CGFloat listInset = ISHWorkspaceUsesPhoneLayout() ? 6.0 : 8.0;
     [NSLayoutConstraint activateConstraints:@[
-        [_rowsStack.topAnchor constraintEqualToAnchor:listCard.topAnchor constant:8],
-        [_rowsStack.leadingAnchor constraintEqualToAnchor:listCard.leadingAnchor constant:8],
-        [_rowsStack.trailingAnchor constraintEqualToAnchor:listCard.trailingAnchor constant:-8],
-        [_rowsStack.bottomAnchor constraintEqualToAnchor:listCard.bottomAnchor constant:-8],
+        [_rowsStack.topAnchor constraintEqualToAnchor:listCard.topAnchor constant:listInset],
+        [_rowsStack.leadingAnchor constraintEqualToAnchor:listCard.leadingAnchor constant:listInset],
+        [_rowsStack.trailingAnchor constraintEqualToAnchor:listCard.trailingAnchor constant:-listInset],
+        [_rowsStack.bottomAnchor constraintEqualToAnchor:listCard.bottomAnchor constant:-listInset],
     ]];
 
     [_contentStack addArrangedSubview:listCard];
@@ -8696,6 +8887,20 @@ static NSURL *ISHWorkspaceBrowserURLFromInput(NSString *input) {
     ]];
 
     [self refreshMonitor:nil];
+
+    [NSNotificationCenter.defaultCenter addObserver:self
+                                           selector:@selector(monitorGaugeStyleDidChange)
+                                               name:ISHWorkspaceGaugeStyleDidChangeNotification
+                                             object:nil];
+}
+
+- (void)monitorGaugeStyleDidChange {
+    // Ring vs bar gauges differ in height, so resize the window to the new style (deferred so the
+    // gauges re-lay-out first) — keeps both gauge rows visible instead of clipping or floating.
+    __weak typeof(self) weakSelf = self;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [(id)weakSelf.workspaceHostViewController autosizeMonitorWindow];
+    });
 }
 
 - (void)viewWillAppear:(BOOL)animated {

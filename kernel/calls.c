@@ -6,6 +6,7 @@
 #include "kernel/calls.h"
 #include "emu/interrupt.h"
 #include "emu/memory.h"
+#include "emu/vec.h"
 #include "kernel/signal.h"
 #include "kernel/task.h"
 #include "fs/devices.h"
@@ -1090,6 +1091,7 @@ static syscall_t i386_syscall_table[] = {
     [340] = (syscall_t) sys_prlimit64,
     [341] = (syscall_t) syscall_eopnotsupp_stub, // name_to_handle_at
     [342] = (syscall_t) syscall_eopnotsupp_stub, // open_by_handle_at
+    [343] = (syscall_t) sys_clock_adjtime, // clock_adjtime (EPERM: iSH can't slew the iOS clock)
     [345] = (syscall_t) sys_sendmmsg,
     [347] = (syscall_t) sys_process_vm_readv,
     [352] = (syscall_t) syscall_stub, // sched_getattr
@@ -1124,6 +1126,7 @@ static syscall_t i386_syscall_table[] = {
     [398] = (syscall_t) sys_shmdt,
     [403] = (syscall_t) sys_clock_gettime64, // clock_gettime64
     [404] = (syscall_t) sys_clock_settime64, // clock_settime64
+    [405] = (syscall_t) sys_clock_adjtime64, // clock_adjtime64 (read-state -> chronyd monitor-only)
     [406] = (syscall_t) sys_clock_getres_time64, // clock_getres_time64
     [407] = (syscall_t) sys_clock_nanosleep_time64, // clock_nanosleep_time64
     [408] = (syscall_t) sys_timer_gettime64, // timer_gettime64
@@ -1140,6 +1143,12 @@ static syscall_t i386_syscall_table[] = {
     [425] = (syscall_t) syscall_stub_silent, // io_uring_setup (mirror amd64: ENOSYS so liburing/cmake fall back to epoll)
     [426] = (syscall_t) syscall_stub_silent, // io_uring_enter
     [427] = (syscall_t) syscall_stub_silent, // io_uring_register
+    [428] = (syscall_t) syscall_stub_silent, // open_tree (new mount API; util-linux falls back to mount(2) on ENOSYS)
+    [429] = (syscall_t) syscall_stub_silent, // move_mount
+    [430] = (syscall_t) syscall_stub_silent, // fsopen
+    [431] = (syscall_t) syscall_stub_silent, // fsconfig
+    [432] = (syscall_t) syscall_stub_silent, // fsmount
+    [433] = (syscall_t) syscall_stub_silent, // fspick
     [434] = (syscall_t) syscall_stub_silent, // pidfd_open
     [435] = (syscall_t) sys_clone3, // clone3
     [436] = (syscall_t) sys_close_range,
@@ -1445,6 +1454,7 @@ static syscall_t amd64_syscall_table[453] = {
     [302] = (syscall_t) sys_prlimit64,
     [303] = (syscall_t) syscall_eopnotsupp_stub, // name_to_handle_at
     [304] = (syscall_t) syscall_eopnotsupp_stub, // open_by_handle_at
+    [305] = (syscall_t) sys_clock_adjtime_amd64, // clock_adjtime (EPERM; full-width read-state TODO)
     [307] = (syscall_t) sys_sendmmsg_amd64,
     [309] = (syscall_t) syscall_success_stub, // getcpu
     [310] = (syscall_t) sys_process_vm_readv,
@@ -2029,6 +2039,10 @@ static bool handle_amd64_native_memory_syscall(struct cpu_state *cpu, qword_t sy
     case 230:
         amd64_syscall_result_qword(cpu, (qword_t) (sqword_t) sys_clock_nanosleep_amd64_guest(
                 (dword_t) raw_args[0], (int_t) raw_args[1], raw_args[2], raw_args[3]));
+        return true;
+    case 305:
+        amd64_syscall_result_qword(cpu, (qword_t) (sqword_t) sys_clock_adjtime_amd64_guest(
+                (dword_t) raw_args[0], raw_args[1]));
         return true;
     case 217:
         amd64_syscall_result_qword(cpu, (qword_t) (sqword_t) sys_getdents64_guest(
@@ -3998,31 +4012,58 @@ static bool amd64_try_emulate_sse2_packed_integer(guest_addr_t ip, struct cpu_st
         break;
     }
 
-    if (!operand_size_prefix || opcode != 0x0f)
+    if (opcode != 0x0f)
         return false;
     if (!amd64_trap_fetch_u8(&decode_ip, &opcode))
         return false;
-    if (opcode != 0xd4 && opcode != 0xf4)
-        return false;
 
+    // 66 0F D4/F4/F5 = paddq / pmuludq / pmaddwd (xmm); no-prefix 0F F5 =
+    // pmaddwd (mmx). These are emulated here in the #UD handler rather than the
+    // JIT bridge: the bridge cannot do the xmm paddq/pmuludq forms, and bridging
+    // MMX pmaddwd trips a JIT block-chaining bug (the instruction *after* it
+    // faults though its next_ip is correct). The #UD path advances rip one
+    // instruction at a time, so it is immune -- the same reason paddq/pmuludq
+    // already live here.
     struct amd64_trap_modrm modrm;
-    if (!amd64_trap_decode_modrm(&decode_ip, rex, &modrm))
-        return false;
-
-    union xmm_reg src;
-    if (!amd64_trap_read_xmm_rm(cpu, &modrm, fs_prefix, decode_ip, &src))
-        return false;
-    union xmm_reg *dst = &cpu->xmm[modrm.reg & 0xf];
-
-    switch (opcode) {
-    case 0xd4: // PADDQ xmm, xmm/m128
-        dst->qw[0] += src.qw[0];
-        dst->qw[1] += src.qw[1];
-        break;
-    case 0xf4: // PMULUDQ xmm, xmm/m128
-        dst->qw[0] = (uint64_t) dst->u32[0] * src.u32[0];
-        dst->qw[1] = (uint64_t) dst->u32[2] * src.u32[2];
-        break;
+    if (operand_size_prefix) {
+        if (opcode != 0xd4 && opcode != 0xf4 && opcode != 0xf5)
+            return false;
+        if (!amd64_trap_decode_modrm(&decode_ip, rex, &modrm))
+            return false;
+        union xmm_reg src;
+        if (!amd64_trap_read_xmm_rm(cpu, &modrm, fs_prefix, decode_ip, &src))
+            return false;
+        union xmm_reg *dst = &cpu->xmm[modrm.reg & 0xf];
+        switch (opcode) {
+        case 0xd4: // PADDQ xmm, xmm/m128
+            dst->qw[0] += src.qw[0];
+            dst->qw[1] += src.qw[1];
+            break;
+        case 0xf4: // PMULUDQ xmm, xmm/m128
+            dst->qw[0] = (uint64_t) dst->u32[0] * src.u32[0];
+            dst->qw[1] = (uint64_t) dst->u32[2] * src.u32[2];
+            break;
+        case 0xf5: // PMADDWD xmm, xmm/m128
+            vec_madd_d128(NULL, &src, dst);
+            break;
+        }
+    } else {
+        if (opcode != 0xf5) // no-prefix: only MMX pmaddwd is handled here
+            return false;
+        if (!amd64_trap_decode_modrm(&decode_ip, rex, &modrm))
+            return false;
+        if (modrm.reg >= 8 || (modrm.is_reg && modrm.rm >= 8))
+            return false; // mm[] has 8 entries; reject an invalid MMX encoding (-> #UD)
+        union mm_reg src_mm;
+        if (modrm.is_reg) {
+            src_mm = cpu->mm[modrm.rm & 7];
+        } else {
+            qword_t v;
+            if (!amd64_trap_read_rm(cpu, &modrm, fs_prefix, decode_ip, 64, &v))
+                return false;
+            src_mm.qw = v;
+        }
+        vec_madd_d64(NULL, &src_mm, &cpu->mm[modrm.reg & 7]);
     }
 
     cpu->amd64_rip = decode_ip;

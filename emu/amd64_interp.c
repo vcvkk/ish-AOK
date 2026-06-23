@@ -6238,6 +6238,28 @@ restart_prefix:
             cpu->amd64_rip = saved_rip;
             return amd64_jit_0f_vec_rm(cpu, tlb, op2, vec_next_ip);
         }
+        // no-66 MMX forms of the packed-int ops added later: punpck{l,h}{bw,wd}
+        // + punpckhdq (60/61/68/69/6a), pack ss/us (63/67/6b), saturating
+        // add/sub (d8/d9/dc/dd), unsigned min/max (da/de), psadbw (f6). The
+        // inline decoder already handles the 66 (XMM) forms, so this is gated to
+        // the no-prefix MMX forms and hands them to the bridge. (The saturating
+        // signed/min-max e8-ee and pavg/pmulhuw e0/e3/e4 + pmaddwd f5 forms are
+        // already delegated by the block above.)
+        if (!operand_size_prefix && rep_mode == AMD64_REP_NONE &&
+                ((op2 >= 0x60 && op2 <= 0x6b && op2 != 0x62 && op2 != 0x64 &&
+                  op2 != 0x65 && op2 != 0x66) ||
+                 op2 == 0xd8 || op2 == 0xd9 || op2 == 0xda || op2 == 0xdc ||
+                 op2 == 0xdd || op2 == 0xde || op2 == 0xf6)) {
+            struct amd64_modrm modrm;
+            if (!amd64_decode_modrm(cpu, tlb, rex, &modrm)) {
+                cpu->amd64_rip = saved_rip;
+                cpu->segfault_addr = saved_rip;
+                return INT_GPF;
+            }
+            unsigned long vec_next_ip = (unsigned long) cpu->amd64_rip;
+            cpu->amd64_rip = saved_rip;
+            return amd64_jit_0f_vec_rm(cpu, tlb, op2, vec_next_ip);
+        }
         // SSE floating-point ops the inline decoder below does not implement:
         // movmskps/pd (50), sqrt (51), rsqrt (52), rcp (53), packed
         // cvtps2pd/cvtpd2ps (5a, scalar cvtss2sd/cvtsd2ss handled above),
@@ -6322,9 +6344,26 @@ restart_prefix:
                     cpu->xmm[modrm.reg] = value;
                 }
             } else if (op2 == 0x11 || op2 == 0x29 || op2 == 0x7f) {
-                if (op2 == 0x7f && !(operand_size_prefix || rep_mode == AMD64_REPZ))
+                if (op2 == 0x7f && !operand_size_prefix && rep_mode == AMD64_REP_NONE) {
+                    // 0F 7F (no mandatory prefix): movq mm/m64, mm — MMX store.
+                    // The shared JIT bridge (amd64_jit_0f_vec_rm, movq_mm_store)
+                    // implements this; mirror it here so a basic block that falls
+                    // back to the interpreter mid-MMX (e.g. libgcrypt SHA
+                    // shuttling state through mm0-7) does not raise a bogus #UD.
+                    // The MMX load (0F 6F) and the 0xd6 MMX<->XMM moves are
+                    // already handled; this completes the store side. Guard the
+                    // MMX register indices to <8, as the bridge and 0x7e do.
+                    if (modrm.reg >= 8 || (modrm.is_reg && modrm.rm >= 8))
+                        return INT_UNDEFINED;
+                    if (modrm.is_reg) {
+                        cpu->mm[modrm.rm] = cpu->mm[modrm.reg];
+                    } else if (!amd64_write_rm(cpu, tlb, &modrm, fs_prefix, 64,
+                                   cpu->mm[modrm.reg].qw)) {
+                        goto amd64_gpf_restore;
+                    }
+                } else if (op2 == 0x7f && !(operand_size_prefix || rep_mode == AMD64_REPZ)) {
                     return INT_UNDEFINED;
-                if (op2 == 0x11 && rep_mode == AMD64_REPZ) {
+                } else if (op2 == 0x11 && rep_mode == AMD64_REPZ) {
                     if (operand_size_prefix)
                         return INT_UNDEFINED;
                     if (modrm.is_reg) {
@@ -6378,7 +6417,10 @@ restart_prefix:
                     cpu->xmm[modrm.reg] = value;
                 }
             } else if (op2 == 0x13) {
-                if (operand_size_prefix || rep_mode != AMD64_REP_NONE || modrm.is_reg)
+                // movlps (NP) / movlpd (66) m64, xmm: both store xmm[63:0] to
+                // memory, so the 66 (movlpd) form must be accepted too -- it was
+                // wrongly #UD'd (chronyd movlpd [rsp+x],xmm). reg form is #UD.
+                if (rep_mode != AMD64_REP_NONE || modrm.is_reg)
                     return INT_UNDEFINED;
                 if (!amd64_write_rm(cpu, tlb, &modrm, fs_prefix, 64, cpu->xmm[modrm.reg].qw[0]))
                     goto amd64_gpf_restore;
@@ -6629,7 +6671,9 @@ restart_prefix:
                     cpu->xmm[modrm.reg] = value;
                 }
             } else if (op2 == 0x17) {
-                if (operand_size_prefix || modrm.is_reg)
+                // movhps (NP) / movhpd (66) m64, xmm: both store xmm[127:64], so
+                // accept the 66 (movhpd) form too (was wrongly #UD'd). reg #UD.
+                if (modrm.is_reg)
                     return INT_UNDEFINED;
                 if (!amd64_write_rm(cpu, tlb, &modrm, fs_prefix, 64, cpu->xmm[modrm.reg].qw[1]))
                     goto amd64_gpf_restore;
@@ -6784,6 +6828,18 @@ restart_prefix:
                                            : cpu->xmm[modrm.reg].u32[0];
                     if (!amd64_write_rm(cpu, tlb, &modrm, fs_prefix, rex.w ? 64 : 32, scalar))
                         goto amd64_gpf_restore;
+                } else if (rep_mode == AMD64_REP_NONE && !operand_size_prefix) {
+                    // 0F 7E (no prefix): movd/movq r/m, mm — MMX store to a GPR
+                    // or memory (movd = 32-bit, movq with REX.W = 64-bit). This
+                    // is the sibling of the 0F 7F MMX store above; the JIT bridge
+                    // (amd64_jit_0f_vec_rm 0x7e) already handles it, so mirror it
+                    // here for the interpreter fallback. reg is an MMX index <8.
+                    if (modrm.reg >= 8)
+                        return INT_UNDEFINED;
+                    qword_t scalar = rex.w ? cpu->mm[modrm.reg].qw
+                                           : (uint32_t) cpu->mm[modrm.reg].qw;
+                    if (!amd64_write_rm(cpu, tlb, &modrm, fs_prefix, rex.w ? 64 : 32, scalar))
+                        goto amd64_gpf_restore;
                 } else {
                     return INT_UNDEFINED;
                 }
@@ -6903,10 +6959,27 @@ restart_prefix:
                 }
                 cpu->xmm[modrm.reg] = value;
             } else if (op2 == 0xd6) {
-                if (!operand_size_prefix || modrm.is_reg)
+                if (operand_size_prefix && rep_mode == AMD64_REP_NONE) {
+                    // 66 0F D6: movq xmm/m64, xmm (store low qword)
+                    if (modrm.is_reg)
+                        return INT_UNDEFINED;
+                    if (!amd64_write_rm(cpu, tlb, &modrm, fs_prefix, 64, cpu->xmm[modrm.reg].qw[0]))
+                        goto amd64_gpf_restore;
+                } else if (rep_mode == AMD64_REPZ && !operand_size_prefix &&
+                           modrm.is_reg && modrm.rm < 8) {
+                    // F3 0F D6: movq2dq xmm, mm — copy the 64-bit MMX register
+                    // into the low qword of the XMM register, zero the upper
+                    // qword. Register-only (gpgv SHA shuttles MMX<->XMM here).
+                    cpu->xmm[modrm.reg].qw[0] = cpu->mm[modrm.rm].qw;
+                    cpu->xmm[modrm.reg].qw[1] = 0;
+                } else if (rep_mode == AMD64_REPNZ && !operand_size_prefix &&
+                           modrm.is_reg && modrm.reg < 8) {
+                    // F2 0F D6: movdq2q mm, xmm — copy the low qword of the XMM
+                    // register into the MMX register. Register-only.
+                    cpu->mm[modrm.reg].qw = cpu->xmm[modrm.rm].qw[0];
+                } else {
                     return INT_UNDEFINED;
-                if (!amd64_write_rm(cpu, tlb, &modrm, fs_prefix, 64, cpu->xmm[modrm.reg].qw[0]))
-                    goto amd64_gpf_restore;
+                }
             } else if (op2 == 0xd7) {
                 uint32_t mask = 0;
                 if (!operand_size_prefix || rep_mode != AMD64_REP_NONE)
@@ -7034,14 +7107,34 @@ restart_prefix:
                 value.qw[1] &= src_xmm.qw[1];
                 cpu->xmm[modrm.reg] = value;
             } else if (op2 == 0xdf) {
-                if (!operand_size_prefix)
+                if (operand_size_prefix) {
+                    // 66 0F DF: pandn xmm (existing).
+                    if (!amd64_read_xmm_rm(cpu, tlb, &modrm, fs_prefix, &src_xmm))
+                        goto amd64_gpf_restore;
+                    value = cpu->xmm[modrm.reg];
+                    value.qw[0] = ~value.qw[0] & src_xmm.qw[0];
+                    value.qw[1] = ~value.qw[1] & src_xmm.qw[1];
+                    cpu->xmm[modrm.reg] = value;
+                } else if (rep_mode == AMD64_REP_NONE) {
+                    // 0F DF (no prefix): pandn mm — MMX (dst = ~dst & src). The
+                    // JIT bridge handles this; mirror it for the interpreter
+                    // fallback. mm[] has 8 entries, so guard the index <8.
+                    if (modrm.reg >= 8 || (modrm.is_reg && modrm.rm >= 8))
+                        return INT_UNDEFINED;
+                    union mm_reg src_mm, dst_mm;
+                    if (modrm.is_reg) {
+                        src_mm = cpu->mm[modrm.rm];
+                    } else {
+                        if (!amd64_read_rm(cpu, tlb, &modrm, fs_prefix, 64, &src_scalar))
+                            goto amd64_gpf_restore;
+                        src_mm.qw = src_scalar;
+                    }
+                    dst_mm = cpu->mm[modrm.reg];
+                    vec_andn64(NULL, &src_mm, &dst_mm);
+                    cpu->mm[modrm.reg] = dst_mm;
+                } else {
                     return INT_UNDEFINED;
-                if (!amd64_read_xmm_rm(cpu, tlb, &modrm, fs_prefix, &src_xmm))
-                    goto amd64_gpf_restore;
-                value = cpu->xmm[modrm.reg];
-                value.qw[0] = ~value.qw[0] & src_xmm.qw[0];
-                value.qw[1] = ~value.qw[1] & src_xmm.qw[1];
-                cpu->xmm[modrm.reg] = value;
+                }
             } else if (op2 == 0xeb) {
                 if (!operand_size_prefix)
                     return INT_UNDEFINED;
@@ -7474,6 +7567,15 @@ restart_prefix:
             }
             if (modrm.reg != 0)
                 return INT_UNDEFINED;
+            break;
+        }
+        if (op2 == 0x77) {
+            // emms (0F 77): empties the x87 FPU tag word. This emulator models
+            // no x87 tag state that gates MMX register access (the i386 decoder
+            // likewise treats emms as ignored), so it is a no-op. No modrm or
+            // operands, so rip is already past the opcode — just continue.
+            // Without this an MMX routine running under (or falling back to) the
+            // interpreter SIGILLs on the trailing emms.
             break;
         }
         if (op2 == 0x0b)
@@ -11548,14 +11650,72 @@ int amd64_jit_0f_vec_rm(struct cpu_state *cpu, struct tlb *tlb,
         bool packed_xmm_misc = (op2 >= 0xd8 && op2 <= 0xe0) ||
             (op2 >= 0xe3 && op2 <= 0xe5) || (op2 >= 0xe8 && op2 <= 0xee);
         bool pack_xmm = op2 == 0x63 || op2 == 0x67 || op2 == 0x6b;
+        // no-66 MMX forms of the packed-int ops the original decoder omitted:
+        // punpck{l,h}{bw,wd} + punpckhdq (0x60/61/68/69/6a), pack ss/us
+        // (0x63/67/6b), saturating add/sub (d8/d9/dc/dd/e8/e9/ec/ed), unsigned
+        // min/max (da/de), signed min/max (ea/ee), pavg (e0/e3), pmulhuw (e4),
+        // psadbw (f6). Handled by the consolidated block below; vec_*64 mirror
+        // the XMM vec_*128. (0x62/64/65/66 are punpckldq/pcmpgt, already handled
+        // above.) NOTE: pmaddwd (f5) is intentionally NOT here -- un-gating it in
+        // the top guard exposed a JIT block-chaining bug where the instruction
+        // *after* an MMX pmaddwd faults (next_ip is correct, yet the next block
+        // dies); left as a follow-up. i386 pmaddwd works (decode.h).
+        bool mmx_extra = !operand_size_prefix && rep_mode == AMD64_REP_NONE &&
+            ((op2 >= 0x60 && op2 <= 0x6b && op2 != 0x62 && op2 != 0x64 &&
+              op2 != 0x65 && op2 != 0x66) ||
+             op2 == 0xd8 || op2 == 0xd9 || op2 == 0xda || op2 == 0xdc ||
+             op2 == 0xdd || op2 == 0xde || op2 == 0xe0 || op2 == 0xe3 ||
+             op2 == 0xe4 || op2 == 0xe8 || op2 == 0xe9 || op2 == 0xea ||
+             op2 == 0xec || op2 == 0xed || op2 == 0xee || op2 == 0xf6);
         if (pshufw || movq_mm_load || movq_mm_store || movnt_mm_store || pcmpeq_mm || pcmpgt_mm ||
-                punpckldq_mm || logic_mm || packed_int_mm || packed_shift_mm || packed_mul_mm) {
+                punpckldq_mm || logic_mm || packed_int_mm || packed_shift_mm || packed_mul_mm ||
+                mmx_extra) {
             if (modrm.reg >= 8 || (modrm.is_reg && modrm.rm >= 8))
                 return INT_UNDEFINED;
         } else if ((modrm.reg >= AMD64_XMM_COUNT) ||
                 (modrm.is_reg && modrm.rm >= AMD64_XMM_COUNT &&
                  !(op2 == 0x7e && !operand_size_prefix && rep_mode == AMD64_REP_NONE)))
             return INT_UNDEFINED;
+        if (mmx_extra) {
+            if (modrm.is_reg) {
+                src_mm = cpu->mm[modrm.rm];
+            } else {
+                if (!amd64_read_rm(cpu, tlb, &modrm, fs_prefix, 64, &src_scalar))
+                    goto amd64_0f_vec_rm_pf;
+                src_mm.qw = src_scalar;
+            }
+            value_mm = cpu->mm[modrm.reg];
+            switch (op2) {
+            case 0x60: vec_unpackl_bw64(NULL, &src_mm, &value_mm); break;
+            case 0x61: vec_unpackl_w64(NULL, &src_mm, &value_mm); break;
+            case 0x63: vec_packss_w64(NULL, &src_mm, &value_mm); break;
+            case 0x67: vec_packsu_w64(NULL, &src_mm, &value_mm); break;
+            case 0x68: vec_unpackh_bw64(NULL, &src_mm, &value_mm); break;
+            case 0x69: vec_unpackh_w64(NULL, &src_mm, &value_mm); break;
+            case 0x6a: vec_unpackh_d64(NULL, &src_mm, &value_mm); break;
+            case 0x6b: vec_packss_d64(NULL, &src_mm, &value_mm); break;
+            case 0xd8: vec_subus_b64(NULL, &src_mm, &value_mm); break;
+            case 0xd9: vec_subus_w64(NULL, &src_mm, &value_mm); break;
+            case 0xda: vec_min_ub64(NULL, &src_mm, &value_mm); break;
+            case 0xdc: vec_addus_b64(NULL, &src_mm, &value_mm); break;
+            case 0xdd: vec_addus_w64(NULL, &src_mm, &value_mm); break;
+            case 0xde: vec_max_ub64(NULL, &src_mm, &value_mm); break;
+            case 0xe0: vec_avg_b64(NULL, &src_mm, &value_mm); break;
+            case 0xe3: vec_avg_w64(NULL, &src_mm, &value_mm); break;
+            case 0xe4: vec_muluu64(NULL, &src_mm, &value_mm); break;
+            case 0xe8: vec_subss_b64(NULL, &src_mm, &value_mm); break;
+            case 0xe9: vec_subss_w64(NULL, &src_mm, &value_mm); break;
+            case 0xea: vec_mins_w64(NULL, &src_mm, &value_mm); break;
+            case 0xec: vec_addss_b64(NULL, &src_mm, &value_mm); break;
+            case 0xed: vec_addss_w64(NULL, &src_mm, &value_mm); break;
+            case 0xee: vec_maxs_w64(NULL, &src_mm, &value_mm); break;
+            case 0xf6: vec_sumabs_w64(NULL, &src_mm, &value_mm); break;
+            }
+            cpu->mm[modrm.reg] = value_mm;
+            cpu->amd64_rip = (qword_t) next_ip;
+            amd64_sync_legacy_regs(cpu);
+            return INT_NONE;
+        }
         if (op2 == 0x10 || op2 == 0x28) {
             if (op2 == 0x10 && rep_mode == AMD64_REPZ) {
                 if (operand_size_prefix)
@@ -11969,7 +12129,9 @@ int amd64_jit_0f_vec_rm(struct cpu_state *cpu, struct tlb *tlb,
                 cpu->xmm[modrm.reg] = value;
             }
         } else if (op2 == 0x13) {
-            if (operand_size_prefix || rep_mode != AMD64_REP_NONE || modrm.is_reg)
+            // movlps (NP) / movlpd (66) m64, xmm: both store xmm[63:0]; accept
+            // the 66 (movlpd) form (was wrongly #UD'd). reg form is #UD.
+            if (rep_mode != AMD64_REP_NONE || modrm.is_reg)
                 return INT_UNDEFINED;
             if (!amd64_write_rm(cpu, tlb, &modrm, fs_prefix, 64, cpu->xmm[modrm.reg].qw[0]))
                 goto amd64_0f_vec_rm_pf;
@@ -12017,7 +12179,9 @@ int amd64_jit_0f_vec_rm(struct cpu_state *cpu, struct tlb *tlb,
                 cpu->xmm[modrm.reg] = value;
             }
         } else if (op2 == 0x17) {
-            if (operand_size_prefix || modrm.is_reg)
+            // movhps (NP) / movhpd (66) m64, xmm: both store xmm[127:64]; accept
+            // the 66 (movhpd) form (was wrongly #UD'd). reg form is #UD.
+            if (modrm.is_reg)
                 return INT_UNDEFINED;
             if (!amd64_write_rm(cpu, tlb, &modrm, fs_prefix, 64, cpu->xmm[modrm.reg].qw[1]))
                 goto amd64_0f_vec_rm_pf;
@@ -12460,7 +12624,12 @@ int amd64_jit_0f_vec_rm(struct cpu_state *cpu, struct tlb *tlb,
             cpu->xmm[modrm.reg] = value;
         } else if (packed_xmm_misc) {
             if (!operand_size_prefix && rep_mode == AMD64_REP_NONE &&
-                    (op2 == 0xdb || op2 == 0xe5 || op2 == 0xeb)) {
+                    (op2 == 0xdb || op2 == 0xdf || op2 == 0xe5 || op2 == 0xeb)) {
+                // MMX (no-prefix) pand (0xdb) / pandn (0xdf) / pmulhw (0xe5) /
+                // por (0xeb). mm[] has only 8 entries; a REX.R/REX.B-extended
+                // index is an invalid MMX encoding (matches the logic_mm guard).
+                if (modrm.reg >= 8 || (modrm.is_reg && modrm.rm >= 8))
+                    return INT_UNDEFINED;
                 if (modrm.is_reg) {
                     src_mm = cpu->mm[modrm.rm];
                 } else {
@@ -12471,6 +12640,8 @@ int amd64_jit_0f_vec_rm(struct cpu_state *cpu, struct tlb *tlb,
                 value_mm = cpu->mm[modrm.reg];
                 if (op2 == 0xdb)
                     vec_and_q64(NULL, &src_mm, &value_mm);
+                else if (op2 == 0xdf)
+                    vec_andn64(NULL, &src_mm, &value_mm);
                 else if (op2 == 0xe5)
                     vec_mulu64(NULL, &src_mm, &value_mm);
                 else
@@ -12635,10 +12806,26 @@ int amd64_jit_0f_vec_rm(struct cpu_state *cpu, struct tlb *tlb,
                 vec_shuffle_ps128(NULL, &src_xmm, &value, imm8);
             cpu->xmm[modrm.reg] = value;
         } else if (op2 == 0xd6) {
-            if (!operand_size_prefix || rep_mode != AMD64_REP_NONE || modrm.is_reg)
+            if (operand_size_prefix && rep_mode == AMD64_REP_NONE) {
+                // 66 0F D6: movq xmm/m64, xmm (store low qword)
+                if (modrm.is_reg)
+                    return INT_UNDEFINED;
+                if (!amd64_write_rm(cpu, tlb, &modrm, fs_prefix, 64, cpu->xmm[modrm.reg].qw[0]))
+                    goto amd64_0f_vec_rm_pf;
+            } else if (rep_mode == AMD64_REPZ && !operand_size_prefix &&
+                       modrm.is_reg && modrm.rm < 8) {
+                // F3 0F D6: movq2dq xmm, mm — 64-bit MMX register into the low
+                // qword of the XMM register, upper qword zeroed. Register-only.
+                cpu->xmm[modrm.reg].qw[0] = cpu->mm[modrm.rm].qw;
+                cpu->xmm[modrm.reg].qw[1] = 0;
+            } else if (rep_mode == AMD64_REPNZ && !operand_size_prefix &&
+                       modrm.is_reg && modrm.reg < 8) {
+                // F2 0F D6: movdq2q mm, xmm — low qword of the XMM register
+                // into the MMX register. Register-only.
+                cpu->mm[modrm.reg].qw = cpu->xmm[modrm.rm].qw[0];
+            } else {
                 return INT_UNDEFINED;
-            if (!amd64_write_rm(cpu, tlb, &modrm, fs_prefix, 64, cpu->xmm[modrm.reg].qw[0]))
-                goto amd64_0f_vec_rm_pf;
+            }
         } else if (op2 == 0xe7) {
             if (rep_mode != AMD64_REP_NONE || modrm.is_reg)
                 return INT_UNDEFINED;
